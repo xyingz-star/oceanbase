@@ -21,10 +21,119 @@
 #include "share/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_print_utils.h"
+#include "lib/file/file_directory_utils.h"
+#include "lib/lock/ob_mutex.h"
+#include <algorithm>
+#include <cstdarg>
+#include <cstdlib>
+#include <cmath>
+#include <unistd.h>
+#include <pwd.h>
 
 namespace oceanbase {
 using namespace common;
 namespace share {
+
+namespace {
+// K-means schedule after ObKmeansCtx::init(). Edit only this file to switch A/B without touching headers
+// (rebuild stays limited to this translation unit). ObSingleKmeansExecutor::init still may call
+// set_kmeans_train_strategy() after init() to override.
+constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_NMBKM;
+
+const int64_t KMEANS_LOG_PATH_MAX = 512;
+const int64_t KMEANS_LOG_IDLE_ROTATE_MS = 120000;  // 2 min idle -> new file for next create index
+char g_kmeans_log_dir[KMEANS_LOG_PATH_MAX] = {0};
+char g_kmeans_log_file_path[KMEANS_LOG_PATH_MAX] = {0};
+FILE *g_kmeans_log_file = nullptr;
+int64_t g_last_kmeans_log_ts = 0;
+lib::ObMutex g_kmeans_log_mutex(common::ObLatchIds::OB_KMEANS_CTX_LOCK);
+
+const char *get_kmeans_log_home_dir()
+{
+  const char *home = getenv("HOME");
+  if (OB_ISNULL(home) || home[0] == '\0') {
+    struct passwd *pw = getpwuid(getuid());
+    if (OB_NOT_NULL(pw) && OB_NOT_NULL(pw->pw_dir)) {
+      home = pw->pw_dir;
+    }
+  }
+  return home;
+}
+
+void kmeans_log_rotate()
+{
+  lib::ObMutexGuard guard(g_kmeans_log_mutex);
+  if (OB_NOT_NULL(g_kmeans_log_file)) {
+    (void)fclose(g_kmeans_log_file);
+    g_kmeans_log_file = nullptr;
+  }
+}
+
+void ensure_kmeans_log_file_open()
+{
+  int64_t now_ms = ObTimeUtility::current_time_ms();
+  if (OB_NOT_NULL(g_kmeans_log_file) && (now_ms - g_last_kmeans_log_ts) <= KMEANS_LOG_IDLE_ROTATE_MS) {
+    return;
+  }
+  lib::ObMutexGuard guard(g_kmeans_log_mutex);
+  if (OB_NOT_NULL(g_kmeans_log_file) && (now_ms - g_last_kmeans_log_ts) <= KMEANS_LOG_IDLE_ROTATE_MS) {
+    return;
+  }
+  if (OB_NOT_NULL(g_kmeans_log_file)) {
+    (void)fclose(g_kmeans_log_file);
+    g_kmeans_log_file = nullptr;
+  }
+  const char *home = get_kmeans_log_home_dir();
+  if (OB_ISNULL(home)) {
+    return;
+  }
+  now_ms = ObTimeUtility::current_time_ms();
+  (void)snprintf(g_kmeans_log_dir, KMEANS_LOG_PATH_MAX, "%s/log", home);
+  (void)snprintf(g_kmeans_log_file_path, KMEANS_LOG_PATH_MAX, "%s/log/kmeans_%ld.log", home, now_ms);
+  (void)FileDirectoryUtils::create_full_path(g_kmeans_log_dir);
+  g_kmeans_log_file = fopen(g_kmeans_log_file_path, "a");
+}
+
+void kmeans_log(const char *fmt, ...)
+  __attribute__((format(printf, 1, 2)));
+
+void kmeans_log(const char *fmt, ...)
+{
+  ensure_kmeans_log_file_open();
+  if (OB_ISNULL(g_kmeans_log_file)) {
+    return;
+  }
+  lib::ObMutexGuard guard(g_kmeans_log_mutex);
+  if (OB_ISNULL(g_kmeans_log_file)) {
+    return;
+  }
+  const int64_t ts_ms = ObTimeUtility::current_time_ms();
+  char buf[1024];
+  int n = snprintf(buf, sizeof(buf), "[%ld] ", ts_ms);
+  if (n <= 0 || n >= (int)sizeof(buf)) {
+    return;
+  }
+  va_list args;
+  va_start(args, fmt);
+  int n2 = vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, args);
+  va_end(args);
+  if (n2 < 0) {
+    return;
+  }
+  n += n2;
+  if (n >= (int)sizeof(buf) - 1) {
+    n = (int)sizeof(buf) - 1;
+  }
+  if (buf[n - 1] != '\n') {
+    buf[n] = '\n';
+    buf[n + 1] = '\0';
+    n++;
+  }
+  (void)fprintf(g_kmeans_log_file, "%s", buf);
+  (void)fflush(g_kmeans_log_file);
+  g_last_kmeans_log_ts = ObTimeUtility::current_time_ms();
+}
+}  // namespace
 // ------------------ ObKmeansCtx implement ------------------
 void ObKmeansCtx::destroy()
 {
@@ -66,6 +175,7 @@ int ObKmeansCtx::init(
     norm_info_ = norm_info;
     is_pq_stage_ = is_pq_stage; // set is_pq_stage from parameter
     is_inited_ = true;
+    train_strategy_ = KMEANS_INIT_DEFAULT_TRAIN_STRATEGY;
   }
   return ret;
 }
@@ -196,6 +306,9 @@ int ObKmeansAlgo::build(const ObIArray<float*> &input_vectors)
     ret = OB_NOT_INIT;
     SHARE_LOG(WARN, "kmeans ctx is not inited", K(ret));
   } else {
+    const int64_t kmeans_start_time = ObTimeUtility::current_time_ms();
+    SHARE_LOG(INFO, "kmeans build start", K(kmeans_ctx_->lists_), K(kmeans_ctx_->dim_), K(input_vectors.count()));
+    kmeans_log("kmeans build start lists=%ld dim=%ld count=%ld", kmeans_ctx_->lists_, kmeans_ctx_->dim_, input_vectors.count());
     ObKMeansStatus last_status = status_;
     int64_t status_start_time = ObTimeUtility::current_time_ms();
     while (OB_SUCC(ret) && !is_finish()) {
@@ -210,6 +323,9 @@ int ObKmeansAlgo::build(const ObIArray<float*> &input_vectors)
         status_start_time = ObTimeUtility::current_time_ms();
       }
     }
+    const int64_t kmeans_cost_ms = ObTimeUtility::current_time_ms() - kmeans_start_time;
+    SHARE_LOG(INFO, "kmeans build finished", K(ret), K(kmeans_cost_ms));
+    kmeans_log("kmeans build finished ret=%d kmeans_cost_ms=%ld", ret, kmeans_cost_ms);
   }
   return ret;
 }
@@ -219,6 +335,7 @@ int ObKmeansAlgo::inner_build(const ObIArray<float*> &input_vectors)
   int ret = OB_SUCCESS;
   switch (status_) {
     case PREPARE_CENTERS: {
+      center_init_start_ms_ = ObTimeUtility::current_time_ms();
       if (kmeans_ctx_->lists_ >= input_vectors.count()) {
         if (OB_FAIL(quick_centers(input_vectors))) {
           SHARE_LOG(WARN, "failed to quick centers", K(ret));
@@ -275,6 +392,9 @@ int ObKmeansAlgo::quick_centers(const ObIArray<float*> &input_vectors)
     }
   }
   if (OB_SUCC(ret)) {
+    const int64_t center_init_cost_ms = ObTimeUtility::current_time_ms() - center_init_start_ms_;
+    SHARE_LOG(INFO, "center init finished (quick_centers)", K(ret), K(center_init_cost_ms));
+    kmeans_log("center_init_finished quick_centers center_init_cost_ms=%ld", center_init_cost_ms);
     status_ = FINISH;
     const int64_t center_count = centers_[cur_idx_].count();
     const int64_t sample_count = input_vectors.count();
@@ -387,6 +507,9 @@ int ObKmeansAlgo::init_centers(const ObIArray<float*> &input_vectors)
     float sum = 0;
 
     if (is_finish) {
+      const int64_t center_init_cost_ms = ObTimeUtility::current_time_ms() - center_init_start_ms_;
+      SHARE_LOG(INFO, "center init finished (kmeans++)", K(ret), K(center_init_cost_ms));
+      kmeans_log("center_init_finished kmeanspp center_init_cost_ms=%ld", center_init_cost_ms);
       status_ = RUNNING_KMEANS;
       const int64_t center_count = centers_[cur_idx_].count();
       const int64_t sample_count = input_vectors.count();
@@ -1363,6 +1486,137 @@ int ObElkanKmeansAlgo::do_build_hgraph_for_centers(const ObVectorIndexParam &par
   return ret;
 }
 
+// Simplified nested mini-batch schedule: each outer iteration trains on prefix [0, b), then b <- min(2b, N).
+// Paper: indices are permuted **once** before training; M_t is always a prefix of that fixed order (not reshuffled per iter).
+// Here we use the order of `input_vectors` as given — for paper-faithful behavior, shuffle once upstream before build.
+// Same Elkan assign + center update as full-batch path; does not use HGraph (prefix passes).
+int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float*> &input_vectors)
+{
+  int ret = OB_SUCCESS;
+  if (RUNNING_KMEANS != status_) {
+    ret = OB_STATE_NOT_MATCH;
+    SHARE_LOG(WARN, "status not match", K(ret), K(status_));
+  } else {
+    const int64_t n = input_vectors.count();
+    int64_t b = std::max(static_cast<int64_t>(1), std::min(n, NMBKM_INITIAL_BATCH));
+    float *centers_distance = nullptr;
+    int32_t *data_cnt_in_cluster = nullptr;
+    const int64_t center_dis_size = max(1L, kmeans_ctx_->lists_ * (kmeans_ctx_->lists_ - 1) / 2);
+    float *tmp = nullptr;
+    if (OB_ISNULL(tmp = static_cast<float *>(ivf_build_mem_ctx_.Allocate(sizeof(float) * center_dis_size)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      SHARE_LOG(WARN, "failed to alloc memory", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
+    } else {
+      MEMSET(tmp, 0, sizeof(float) * center_dis_size);
+      centers_distance = tmp;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(data_cnt_in_cluster =
+          static_cast<int32_t *>(ivf_build_mem_ctx_.Allocate(sizeof(int32_t) * kmeans_ctx_->lists_)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        SHARE_LOG(WARN, "failed to alloc memory", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
+      } else {
+        MEMSET(data_cnt_in_cluster, 0, sizeof(int32_t) * kmeans_ctx_->lists_);
+      }
+    }
+
+    const int64_t dim = kmeans_ctx_->dim_;
+    float prev_mean_dis = 0.f;
+
+    if (OB_SUCC(ret) && enable_hgraph_) {
+      LOG_INFO("KTS_NMBKM: skip HGraph for growing-prefix passes; using Elkan bounds only", K(b), K(n));
+    }
+
+    for (int64_t iter = 0; OB_SUCC(ret) && iter < N_ITER; ++iter) {
+      if (check_stop()) {
+        ret = OB_CANCELED;
+        SHARE_LOG(INFO, "kmeans ctx is fore stop", K(ret), K(*this));
+        break;
+      }
+      const int64_t iter_start_time = ObTimeUtility::current_time_ms();
+      float dis_sum = 0.f;
+      MEMSET(data_cnt_in_cluster, 0, sizeof(int32_t) * kmeans_ctx_->lists_);
+      centers_[next_idx()].clear();
+
+      float distance = 0.f;
+      for (int64_t i = 0; OB_SUCC(ret) && i < kmeans_ctx_->lists_; ++i) {
+        for (int64_t j = i + 1; OB_SUCC(ret) && j < kmeans_ctx_->lists_; ++j) {
+          if (OB_FAIL(calc_kmeans_distance(centers_[cur_idx_].at(i), centers_[cur_idx_].at(j), dim, distance))) {
+            SHARE_LOG(WARN, "failed to calc kmeans distance between centers", K(ret));
+          } else {
+            set_centers_distance(centers_distance, i, j, distance);
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(assign_vectors_range(input_vectors, 0, b, centers_distance, data_cnt_in_cluster, dis_sum, false))) {
+          SHARE_LOG(WARN, "failed to assign vectors range (nested)", K(ret));
+        }
+      }
+      const float mean_dis = (b > 0) ? dis_sum / static_cast<float>(b) : 0.f;
+
+      for (int64_t i = 0; OB_SUCC(ret) && i < kmeans_ctx_->lists_; ++i) {
+        if (data_cnt_in_cluster[i] > 0) {
+          if (OB_FAIL(centers_[next_idx()].divide(i, data_cnt_in_cluster[i]))) {
+            SHARE_LOG(WARN, "failed to divide vector", K(ret));
+          }
+        } else {
+          const int64_t sample_cnt_prefix = b;
+          int64_t random = 0;
+          random = ObRandom::rand(0, std::max(static_cast<int64_t>(0), sample_cnt_prefix - 1));
+          if (OB_FAIL(centers_[next_idx()].add(i, kmeans_ctx_->dim_, input_vectors.at(random)))) {
+            SHARE_LOG(WARN, "failed to add vector", K(ret));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(kmeans_ctx_->try_normalize(
+                  kmeans_ctx_->dim_, centers_[next_idx()].at(i), centers_[next_idx()].at(i)))) {
+            LOG_WARN("failed to normalize vector", K(ret));
+          }
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const double imbalance_factor = calc_imbalance_factor(input_vectors, data_cnt_in_cluster);
+        const float diff = (iter == 0) ? 1.0f : fabsf(prev_mean_dis - mean_dis) / prev_mean_dis;
+        prev_mean_dis = mean_dis;
+        if (OB_NOT_NULL(kmeans_monitor_)) {
+          kmeans_monitor_->set_kmeams_monitor(iter, EARLY_FINISH_THRESHOLD, diff, imbalance_factor);
+        }
+        if (iter > 0 && diff <= EARLY_FINISH_THRESHOLD) {
+          const int64_t iter_cost_ms = ObTimeUtility::current_time_ms() - iter_start_time;
+          LOG_INFO("finish nested kmeans before all iters", K(ret), K(iter), K(mean_dis), K(diff), K(imbalance_factor));
+          kmeans_log("kmeans_nested iter=%ld b=%ld iter_cost_ms=%ld mean_dis=%.6f diff=%.6f early_stop=1",
+                     iter, b, iter_cost_ms, mean_dis, diff);
+          break;
+        } else {
+          cur_idx_ = next_idx();
+          const int64_t iter_cost_ms = ObTimeUtility::current_time_ms() - iter_start_time;
+          LOG_INFO("finish one nested kmeans iter", K(ret), K(iter), K(b), K(mean_dis), K(diff), K(iter_cost_ms));
+          kmeans_log("kmeans_nested iter=%ld b=%ld iter_cost_ms=%ld mean_dis=%.6f diff=%.6f",
+                     iter, b, iter_cost_ms, mean_dis, diff);
+          b = std::min(b * 2, n);
+        }
+      }
+    }
+
+    const int64_t mem_used = ivf_build_mem_ctx_.get_all_vsag_use_mem_byte() >> 20;
+    LOG_INFO("nested minibatch kmeans memused", K(ret), K(mem_used));
+    if (OB_NOT_NULL(centers_distance)) {
+      ivf_build_mem_ctx_.Deallocate(centers_distance);
+      centers_distance = nullptr;
+    }
+    if (OB_NOT_NULL(data_cnt_in_cluster)) {
+      ivf_build_mem_ctx_.Deallocate(data_cnt_in_cluster);
+      data_cnt_in_cluster = nullptr;
+    }
+    if (OB_SUCC(ret)) {
+      status_ = FINISH;
+    }
+  }
+  return ret;
+}
+
 int ObElkanKmeansAlgo::do_kmeans(const ObIArray<float*> &input_vectors)
 {
   int ret = OB_SUCCESS;
@@ -1370,6 +1624,8 @@ int ObElkanKmeansAlgo::do_kmeans(const ObIArray<float*> &input_vectors)
   if (RUNNING_KMEANS != status_) {
     ret = OB_STATE_NOT_MATCH;
     SHARE_LOG(WARN, "status not match", K(ret), K(status_));
+  } else if (OB_UNLIKELY(kmeans_ctx_->get_train_strategy() == KTS_NMBKM)) {
+    ret = do_kmeans_nested_minibatch(input_vectors);
   } else {
     // Upper triangular matrix
     float* centers_distance = nullptr; // half the distance between each two centers
@@ -1455,11 +1711,15 @@ int ObElkanKmeansAlgo::do_kmeans(const ObIArray<float*> &input_vectors)
           kmeans_monitor_->set_kmeams_monitor(iter, EARLY_FINISH_THRESHOLD, diff, imbalance_factor);
         }
         if (iter > 0 && diff <= EARLY_FINISH_THRESHOLD) {
+          const int64_t iter_cost_ms = ObTimeUtility::current_time_ms() - iter_start_time;
           LOG_INFO("finish do kmeans before all iters", K(ret), K(iter), K(dis_obj), K(diff), K(imbalance_factor));
+          kmeans_log("kmeans iter iter=%ld iter_cost_ms=%ld loss=%.6f diff=%.6f early_stop=1", iter, iter_cost_ms, dis_obj, diff);
           break;  // finish
         } else {
           cur_idx_ = next_idx();
-          LOG_INFO("finish one iters", K(ret), K(iter), K(dis_obj), K(diff), K(ObTimeUtility::current_time_ms() - iter_start_time));
+          const int64_t iter_cost_ms = ObTimeUtility::current_time_ms() - iter_start_time;
+          LOG_INFO("finish one iters", K(ret), K(iter), K(dis_obj), K(diff), K(iter_cost_ms));
+          kmeans_log("kmeans iter iter=%ld iter_cost_ms=%ld loss=%.6f diff=%.6f", iter, iter_cost_ms, dis_obj, diff);
           if (iter + 1 >= N_ITER) {
             LOG_INFO("finish do kmeans iters", K(ret), K(iter), K(dis_obj), K(diff), K(imbalance_factor));
           }

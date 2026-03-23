@@ -98,6 +98,13 @@ enum ObKmeansAlgoType
   KAT_MAX
 };
 
+// Training loop variant for ObElkanKmeansAlgo::do_kmeans (same assign/update primitives, different scheduling).
+enum ObKmeansTrainStrategy : uint8_t
+{
+  KTS_FULL_BATCH = 0,  // default: full-data Lloyd iteration each round (current behavior)
+  KTS_NMBKM = 1        // simplified nested mini-batch: growing prefix [0, b) per outer iter, b doubles until N
+};
+
 // for descripe vec index adaptive scan try path, choose from: pre, post and in-filter
 enum ObVecIdxAdaTryPath : uint8_t
 {

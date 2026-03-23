@@ -1,5 +1,6 @@
 if(OB_BUILD_OPENSOURCE)
   ob_unittest(test_vector_index_serialize)
+  ob_unittest(test_kmeans)
 else()
   set(DATA_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/data/dataset.tar.gz")
   set(BUILD_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data")

@@ -49,6 +49,7 @@ public:
       ivf_build_mem_ctx_(ivf_build_mem_ctx),
       norm_info_(nullptr),
       is_pq_stage_(false),
+      train_strategy_(KTS_FULL_BATCH),
       lock_(common::ObLatchIds::OB_KMEANS_CTX_LOCK),
       sample_vectors_()
   {}
@@ -71,6 +72,8 @@ public:
   int try_normalize_samples() const;
   int append_sample_vector(float* vector);
   bool is_empty() { return sample_vectors_.empty(); }
+  OB_INLINE void set_train_strategy(const ObKmeansTrainStrategy s) { train_strategy_ = s; }
+  OB_INLINE ObKmeansTrainStrategy get_train_strategy() const { return train_strategy_; }
 
   TO_STRING_KV(K(is_inited_),
                K(dim_),
@@ -97,6 +100,7 @@ public:
   ObIvfMemContext &ivf_build_mem_ctx_; // from ObIvfBuildHelper, used for alloc memory for kmeans build process
   ObVectorNormalizeInfo *norm_info_;
   bool is_pq_stage_; // true for PQ quantization stage, false for IVF clustering stage
+  ObKmeansTrainStrategy train_strategy_;  // full-batch Lloyd vs simplified nested mini-batch loop
   lib::ObMutex lock_; // for sample_vectors_
   ObSEArray<float*, 64> sample_vectors_;
 };
@@ -123,7 +127,8 @@ public:
       max_assign_tasks_(0),
       enable_parallel_(false),
       kmeans_monitor_(nullptr),
-      enable_hgraph_(false)
+      enable_hgraph_(false),
+      center_init_start_ms_(0)
   {}
   virtual ~ObKmeansAlgo() {
     ObKmeansAlgo::destroy();
@@ -193,6 +198,7 @@ protected:
   bool enable_parallel_; // Whether to enable parallel computation
   ObKmeansMonitor *kmeans_monitor_;
   bool enable_hgraph_; // control whether to enable HGraph acceleration
+  int64_t center_init_start_ms_; // for logging center init total time
 };
 
 class ObElkanKmeansAlgo : public ObKmeansAlgo
@@ -216,6 +222,7 @@ protected:
   virtual int do_kmeans(const ObIArray<float*> &input_vectors) override;
 
 private:
+  int do_kmeans_nested_minibatch(const ObIArray<float*> &input_vectors);
   int search_nearest_center(const ObIArray<float *> &input_vectors, float *centers_distance,
                             int32_t *data_cnt_in_cluster, float &dis_obj);
   int assign_vectors_parallel(const ObIArray<float *> &input_vectors, float *centers_distance,
@@ -225,6 +232,7 @@ protected:
   static constexpr float GATE_DISTANCE_FACTOR = 4.0; // for gate distance
   static constexpr float EARLY_FINISH_THRESHOLD = 1e-3F; // 0.1% for early finish threshold
   static const int64_t N_ITER = 25; // for max iterations
+  static constexpr int64_t NMBKM_INITIAL_BATCH = 1024; // first prefix size for KTS_NMBKM (capped by N)
   common::ObSpinLock assign_lock_; // Lock to protect vector assignment operations
 
 private:
@@ -257,6 +265,7 @@ public:
            ObVectorIndexDistAlgorithm dist_algo,
            ObVectorNormalizeInfo *norm_info = nullptr,
            const int64_t pq_m_size = 1) = 0;
+  OB_INLINE void set_kmeans_train_strategy(const ObKmeansTrainStrategy s) { ctx_.set_train_strategy(s); }
   virtual int get_center(const int64_t pos, float *&center_vector) = 0;
   virtual int append_sample_vector(float* vector);
   OB_INLINE int64_t get_max_sample_count() { return ctx_.max_sample_count_; }
