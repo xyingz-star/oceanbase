@@ -216,7 +216,11 @@ public:
   virtual void destroy() override;
   int assign_vectors_range(const ObIArray<float *> &input_vectors, int64_t start_idx, int64_t end_idx,
                            float *centers_distance, int32_t *data_cnt_in_cluster, float &dis_obj,
-                           bool use_safe_add = false);
+                           bool use_safe_add = false,
+                           int32_t *nearest_label_out = nullptr,
+                           float *min_d2_out = nullptr,
+                           bool accumulate_to_centers = true,
+                           bool allow_hgraph_assign = true);
 
 protected:
   virtual int do_kmeans(const ObIArray<float*> &input_vectors) override;
@@ -226,13 +230,18 @@ private:
   int search_nearest_center(const ObIArray<float *> &input_vectors, float *centers_distance,
                             int32_t *data_cnt_in_cluster, float &dis_obj);
   int assign_vectors_parallel(const ObIArray<float *> &input_vectors, float *centers_distance,
-                              int32_t *data_cnt_in_cluster, float &dis_obj);
+                              int32_t *data_cnt_in_cluster, float &dis_obj,
+                              int32_t *nearest_label_out = nullptr,
+                              float *min_d2_out = nullptr,
+                              bool accumulate_to_centers = true,
+                              bool allow_hgraph_assign = true);
+  int elkan_find_nearest(const float *sample_vector, float *centers_distance,
+                         int64_t &nearest_center_idx, float &min_distance);
 
 protected:
   static constexpr float GATE_DISTANCE_FACTOR = 4.0; // for gate distance
   static constexpr float EARLY_FINISH_THRESHOLD = 1e-3F; // 0.1% for early finish threshold
   static const int64_t N_ITER = 25; // for max iterations
-  static constexpr int64_t NMBKM_INITIAL_BATCH = 1024; // first prefix size for KTS_NMBKM (capped by N)
   common::ObSpinLock assign_lock_; // Lock to protect vector assignment operations
 
 private:
@@ -632,7 +641,11 @@ struct ObKmeansAssignTaskCtx {
         input_vectors_(nullptr),
         centers_distance_(nullptr),
         data_cnt_in_cluster_(nullptr),
-        dis_obj_(0.0f)
+        dis_obj_(0.0f),
+        nearest_label_out_(nullptr),
+        min_d2_out_(nullptr),
+        accumulate_to_centers_(true),
+        allow_hgraph_assign_(true)
   {}
   TO_STRING_KV(K_(start_idx), K_(end_idx), K_(dis_obj));
   void reset()
@@ -643,6 +656,10 @@ struct ObKmeansAssignTaskCtx {
     centers_distance_ = nullptr;
     data_cnt_in_cluster_ = nullptr;
     dis_obj_ = 0.0f;
+    nearest_label_out_ = nullptr;
+    min_d2_out_ = nullptr;
+    accumulate_to_centers_ = true;
+    allow_hgraph_assign_ = true;
   }
   int64_t start_idx_;
   int64_t end_idx_;
@@ -650,6 +667,10 @@ struct ObKmeansAssignTaskCtx {
   float* centers_distance_;
   int32_t* data_cnt_in_cluster_;
   float dis_obj_;
+  int32_t *nearest_label_out_;
+  float *min_d2_out_;
+  bool accumulate_to_centers_;
+  bool allow_hgraph_assign_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObKmeansAssignTaskCtx);
@@ -716,7 +737,9 @@ public:
   virtual ~ObKmeansAssignTask() = default;
 
   int init(int64_t start_idx, int64_t end_idx, ObElkanKmeansAlgo *algo, const ObIArray<float *> *input_vectors,
-           float *centers_distance, int32_t *data_cnt_in_cluster);
+           float *centers_distance, int32_t *data_cnt_in_cluster,
+           int32_t *nearest_label_out = nullptr, float *min_d2_out = nullptr,
+           bool accumulate_to_centers = true, bool allow_hgraph_assign = true);
   virtual void reset() override;
   virtual void set_task_stop() override {
     if (OB_NOT_NULL(algo_)) {
