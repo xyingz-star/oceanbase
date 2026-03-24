@@ -39,13 +39,11 @@ namespace {
 // K-means schedule after ObKmeansCtx::init(). Edit only this file to switch A/B without touching headers
 // (rebuild stays limited to this translation unit). ObSingleKmeansExecutor::init still may call
 // set_kmeans_train_strategy() after init() to override.
-constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_FULL_BATCH;//KTS_FULL_BATCH;//KTS_NMBKM;
+constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_NMBKM;//KTS_FULL_BATCH;//KTS_NMBKM;
 // NMBKM only: b=n from start, no doubling (full-batch assignment size). Kept in .cpp so toggling does not recompile dependents of the header.
 constexpr bool NMBKM_FORCE_FULL_BATCH = false;//true;
 constexpr int64_t NMBKM_INITIAL_BATCH = 32768; // first prefix size for KTS_NMBKM (capped by N)
 constexpr float NMBKM_RHO = 10.f; // Newling & Fleuret (2016) default doubling threshold
-// Upper cap on prefix-assignments between full-dataset loss checks (paired with 2*n below so huge n does not stall checks).
-constexpr int64_t NMBKM_GLOBAL_LOSS_ASSIGN_INTERVAL = 16 * NMBKM_INITIAL_BATCH;
 
 const int64_t KMEANS_LOG_PATH_MAX = 512;
 const int64_t KMEANS_LOG_IDLE_ROTATE_MS = 120000;  // 2 min idle -> new file for next create index
@@ -1522,6 +1520,9 @@ OB_INLINE float *nmbkm_cluster_row(float *S_sum, const int64_t dim, const int64_
 //   (equivalent to remove+readd on M_{t−1} plus new points; assign_vectors_parallel when |M_t| is large).
 // - sigma/p, rho doubling rule matches the paper; per-point lower bounds l(i,*) are not stored (Elkan recomputed).
 // - HGraph is not used on this path (prefix passes).
+// - Early stop uses prefix mean assign distance vs last iter: (1) if rho keeps b unchanged but change is tiny,
+//   force double b once; if after that larger batch the change is still tiny, stop; (2) once b==n (full prefix),
+//   also stop when change vs previous iter is tiny (same spirit as full-batch k-means), without needing pending.
 int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input_vectors)
 {
   int ret = OB_SUCCESS;
@@ -1633,12 +1634,8 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
       }
     }
 
-    // 累加每轮前缀赋值样本数 b_prev；每满 min(2*n, NMBKM_GLOBAL_LOSS_ASSIGN_INTERVAL) 做一次全数据集 mean 距离并扣减同值。
-    int64_t assigns_since_full_loss = 0;
-    float prev_full_loss_mean_distance = 0.f;
-    int64_t full_loss_checkpoint_count = 0;
-    float logged_full_mean_assign_distance = 0.f;
-    float full_mean_relative_change = 1.0f;
+    float prev_prefix_mean_assign_distance = 0.f;
+    bool pending_stall_check_after_forced_expand = false;
 
     if (OB_SUCC(ret) && enable_hgraph_) {
       LOG_INFO("KTS_NMBKM: skip HGraph for nested mini-batch passes; Elkan only", K(b), K(n));
@@ -1661,17 +1658,7 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
         }
       }
 
-      if (iter == 0) {
-        float full_dis_sum = 0.f;
-        if (OB_SUCC(ret) && OB_FAIL(assign_vectors_parallel(input_vectors, centers_distance, nullptr, full_dis_sum,
-                                                            nullptr, nullptr, false, false))) {
-          SHARE_LOG(WARN, "nmbatch iter0 full_dataset loss: assign sum failed", K(ret));
-        } else if (OB_SUCC(ret)) {
-          const float mean_dis = full_dis_sum / static_cast<float>(n);
-          kmeans_log("kmeans_nmbatch iter0 full_dataset_mean_assign_dis=%.6f n=%ld", mean_dis, n);
-        }
-      }
-
+      float prefix_dis_sum = 0.f;
       // --- Full prefix M_t: zero stats, then assign all perm[0..b−1] (parallel Elkan when |M_t| large enough) ---
       if (OB_SUCC(ret) && b > 0) {
         MEMSET(S_sum, 0, sizeof(float) * static_cast<size_t>(k) * static_cast<size_t>(dim));
@@ -1692,6 +1679,7 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
                                                              nearest_scratch, d2_scratch))) {
             SHARE_LOG(WARN, "nmbatch parallel assign failed", K(ret));
           } else if (OB_SUCC(ret)) {
+            prefix_dis_sum = dis_parallel;
             for (int64_t j = 0; j < k; ++j) {
               MEMCPY(nmbkm_cluster_row(S_sum, dim, j), centers_[next_idx()].at(j), sizeof(float) * static_cast<size_t>(dim));
               cluster_v[j] = data_cnt_in_cluster[j];
@@ -1722,6 +1710,7 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
               cluster_sse[nc] += d2;
               nmbkm_row_add(nmbkm_cluster_row(S_sum, dim, nc), x, dim);
               cluster_v[nc]++;
+              prefix_dis_sum += min_dist;
             }
           }
         }
@@ -1774,6 +1763,15 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
         }
       }
 
+      const float prefix_mean_assign_distance =
+          (OB_SUCC(ret) && b > 0) ? (prefix_dis_sum / static_cast<float>(b)) : 0.f;
+      constexpr float batch_mean_floor = 1e-20f;
+      const float batch_mean_relative_change =
+          (iter == 0 || prev_prefix_mean_assign_distance <= batch_mean_floor)
+              ? 1.0f
+              : (fabsf(prefix_mean_assign_distance - prev_prefix_mean_assign_distance) /
+                 prev_prefix_mean_assign_distance);
+
       int64_t b_next = b;
       if (OB_SUCC(ret) && !NMBKM_FORCE_FULL_BATCH && b < n) {
         const bool have_ratio = (min_sigma_over_p < FLT_MAX);
@@ -1781,62 +1779,42 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
           b_next = std::min(b * 2, n);
         }
       }
+      const int64_t b_after_rho_rule = b_next;
+      bool forced_expand_for_low_batch_diff = false;
+      if (OB_SUCC(ret) && !NMBKM_FORCE_FULL_BATCH && b < n && b_next == b) {
+        if (iter > 0 && batch_mean_relative_change <= EARLY_FINISH_THRESHOLD) {
+          const int64_t doubled = std::min(b * 2, n);
+          if (doubled > b) {
+            b_next = doubled;
+            forced_expand_for_low_batch_diff = true;
+          }
+        }
+      }
       b_prev = b;
       b = b_next;
 
       if (OB_SUCC(ret)) {
         bool early_stop_by_loss_threshold = false;
-        bool full_loss_flag = false;
-
-        if (n > 0 && b_prev > 0) {
-          assigns_since_full_loss += b_prev;
-          // 小 n 用 2*n 跟数据规模挂钩；大 n 用 NMBKM_GLOBAL_LOSS_ASSIGN_INTERVAL 封顶，避免检查过稀。
-          const int64_t full_loss_thres =2LL * n < NMBKM_GLOBAL_LOSS_ASSIGN_INTERVAL ? 2LL * n : NMBKM_GLOBAL_LOSS_ASSIGN_INTERVAL;
-          if (OB_SUCC(ret) && assigns_since_full_loss >= full_loss_thres) {
-            assigns_since_full_loss -= full_loss_thres;
-            full_loss_flag = true;
-          } else if (iter == N_ITER - 1) {
-            // Always log one full-dataset mean distance on the last iteration (no assign counter debit).
-            full_loss_flag = true;
-          }
-        } else if (iter == N_ITER - 1) {
-          full_loss_flag = true;
-        }
-
-        if (full_loss_flag) {
-          constexpr float min_mean_distance_floor = 1e-20f;
-          // assign_vectors_parallel walks i in [0, n) with input_vectors.at(i): sum of min-distances over all n points.
-          float full_dis_sum = 0.f;
-          if (OB_SUCC(ret) && OB_FAIL(assign_vectors_parallel(input_vectors, centers_distance, nullptr, full_dis_sum,
-                                                               nullptr, nullptr, false, false))) {
-            SHARE_LOG(WARN, "nmbkm global loss: full assign sum failed", K(ret));
-          }
-          if (OB_SUCC(ret)) {
-            logged_full_mean_assign_distance = full_dis_sum / static_cast<float>(n);
-            if (full_loss_checkpoint_count == 0) {
-              full_mean_relative_change = 1.0f;
-            } else if (prev_full_loss_mean_distance > min_mean_distance_floor) {
-              full_mean_relative_change =
-                  fabsf(prev_full_loss_mean_distance - logged_full_mean_assign_distance) /
-                  prev_full_loss_mean_distance;
-            } else {
-              full_mean_relative_change = 1.0f;
-            }
-            prev_full_loss_mean_distance = logged_full_mean_assign_distance;
-            ++full_loss_checkpoint_count;
+        if (iter > 0 && batch_mean_relative_change <= EARLY_FINISH_THRESHOLD) {
+          if (pending_stall_check_after_forced_expand) {
+            early_stop_by_loss_threshold = true;
             kmeans_log(
-                "kmeans_nmbatch global_loss ckpt=%ld mean_dis=%.6f diff=%.6f assigns_rem=%ld iter=%ld b=%ld",
-                full_loss_checkpoint_count, logged_full_mean_assign_distance, full_mean_relative_change,
-                assigns_since_full_loss, iter, b_prev);
-            // Only stop in the same iteration we actually computed full-dataset loss (not on stale diff).
-            if (full_loss_checkpoint_count >= 2 && full_mean_relative_change <= EARLY_FINISH_THRESHOLD) {
-              early_stop_by_loss_threshold = true;
-            }
+                "kmeans_nmbatch early_stop batch_diff=%.6f <= thr after forced_expand iter=%ld b_used=%ld",
+                batch_mean_relative_change, iter, b_prev);
+          } else if (b_prev == n) {
+            early_stop_by_loss_threshold = true;
+            kmeans_log(
+                "kmeans_nmbatch early_stop batch_diff=%.6f <= thr full_batch b==n iter=%ld n=%ld",
+                batch_mean_relative_change, iter, n);
           }
         }
+        pending_stall_check_after_forced_expand = forced_expand_for_low_batch_diff;
+        prev_prefix_mean_assign_distance = prefix_mean_assign_distance;
+        kmeans_log(
+            "kmeans_nmbatch iter=%ld prefix_mean=%.6f batch_diff=%.6f b=%ld->%ld rho_would=%ld forced_low_diff=%d",
+            iter, prefix_mean_assign_distance, batch_mean_relative_change, b_prev, b, b_after_rho_rule,
+            forced_expand_for_low_batch_diff ? 1 : 0);
 
-        // Must run after each successful iter so get_cur_centers() sees latest means; loss early-stop must not
-        // break out of the iter loop before this swap (new centers live in centers_[next_idx()] until then).
         cur_idx_ = next_idx();
         if (early_stop_by_loss_threshold) {
           break;
