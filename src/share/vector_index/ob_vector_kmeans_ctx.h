@@ -241,7 +241,6 @@ private:
 protected:
   static constexpr float GATE_DISTANCE_FACTOR = 4.0; // for gate distance
   static constexpr float EARLY_FINISH_THRESHOLD = 1e-3F; // 0.1% for early finish threshold
-  static const int64_t N_ITER = 25; // for max iterations
   common::ObSpinLock assign_lock_; // Lock to protect vector assignment operations
 
 private:

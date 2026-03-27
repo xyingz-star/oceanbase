@@ -39,12 +39,13 @@ namespace {
 // K-means schedule after ObKmeansCtx::init(). Edit only this file to switch A/B without touching headers
 // (rebuild stays limited to this translation unit). ObSingleKmeansExecutor::init still may call
 // set_kmeans_train_strategy() after init() to override.
-constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_NMBKM;//KTS_FULL_BATCH;//KTS_NMBKM;
+constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_FULL_BATCH;//KTS_FULL_BATCH;//KTS_NMBKM;
 // NMBKM only: b=n from start, no doubling (full-batch assignment size). Kept in .cpp so toggling does not recompile dependents of the header.
 constexpr bool NMBKM_FORCE_FULL_BATCH = false;//true;
-constexpr int64_t NMBKM_INITIAL_BATCH = 32768; // first prefix size for KTS_NMBKM (capped by N)
+constexpr int64_t NMBKM_INITIAL_BATCH = 16384; // first prefix size for KTS_NMBKM (capped by N)
 constexpr float NMBKM_RHO = 10.f; // Newling & Fleuret (2016) default doubling threshold
 
+const int64_t N_ITER = 100; // for max iterations
 const int64_t KMEANS_LOG_PATH_MAX = 512;
 const int64_t KMEANS_LOG_IDLE_ROTATE_MS = 120000;  // 2 min idle -> new file for next create index
 char g_kmeans_log_dir[KMEANS_LOG_PATH_MAX] = {0};
@@ -1512,13 +1513,27 @@ OB_INLINE float *nmbkm_cluster_row(float *S_sum, const int64_t dim, const int64_
 {
   return S_sum + j * dim;
 }
+// Prefix batch growth: while b < n/2 use doubling (cap n); once b >= n/2 add max(floor((n-b)/2),1) per step.
+OB_INLINE int64_t nmbkm_next_batch_size(const int64_t b, const int64_t n)
+{
+  if (b >= n) {
+    return n;
+  }
+  if (b >= n / 2) {
+    const int64_t left = n - b;
+    const int64_t step = std::max(left / 2, static_cast<int64_t>(1));
+    return std::min(b + step, n);
+  }
+  return std::min(b * 2, n);
+}
 }  // namespace
 
 // Nested mini-batch k-means (nmbatch), Newling & Fleuret (2016), Algorithm nmbatch.
 // - One Fisher–Yates shuffle defines a fixed order; M_t is the prefix {0,…,b_t−1} in that order.
 // - Each outer iter: zero S_sum / cluster_v / cluster_sse, then Elkan-assign all perm[0..b−1] and re-accumulate
 //   (equivalent to remove+readd on M_{t−1} plus new points; assign_vectors_parallel when |M_t| is large).
-// - sigma/p, rho doubling rule matches the paper; per-point lower bounds l(i,*) are not stored (Elkan recomputed).
+// - sigma/p, rho rule: batch step uses nmbkm_next_batch_size (double until b>=n/2 then +floor(left/2)).
+//   per-point lower bounds l(i,*) are not stored (Elkan recomputed).
 // - HGraph is not used on this path (prefix passes).
 // - Early stop uses prefix mean assign distance vs last iter: (1) if rho keeps b unchanged but change is tiny,
 //   force double b once; if after that larger batch the change is still tiny, stop; (2) once b==n (full prefix),
@@ -1635,7 +1650,12 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
     }
 
     float prev_prefix_mean_assign_distance = 0.f;
+    float last_prefix_mean_assign_distance = 0.f;
     bool pending_stall_check_after_forced_expand = false;
+    // Forced batch double: looser threshold max(first_stable_diff/10, EARLY); skip first iter after b changes.
+    int64_t nmbkm_b_prev_iter_start = -1;
+    float nmbkm_first_diff_for_expand = 0.f;
+    int64_t nmbkm_b_for_first_diff = -1;
 
     if (OB_SUCC(ret) && enable_hgraph_) {
       LOG_INFO("KTS_NMBKM: skip HGraph for nested mini-batch passes; Elkan only", K(b), K(n));
@@ -1647,6 +1667,8 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
         SHARE_LOG(INFO, "kmeans ctx is fore stop", K(ret), K(*this));
         break;
       }
+      const int64_t iter_start_time = ObTimeUtility::current_time_ms();
+      const int64_t nmbkm_b_start = b;
       float distance = 0.f;
       for (int64_t i = 0; OB_SUCC(ret) && i < k; ++i) {
         for (int64_t j = i + 1; OB_SUCC(ret) && j < k; ++j) {
@@ -1772,26 +1794,39 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
               : (fabsf(prefix_mean_assign_distance - prev_prefix_mean_assign_distance) /
                  prev_prefix_mean_assign_distance);
 
+      const bool nmbkm_stable_b = (iter > 0 && nmbkm_b_start == nmbkm_b_prev_iter_start);
+      float expand_thr = EARLY_FINISH_THRESHOLD;
+      if (nmbkm_stable_b) {
+        if (nmbkm_b_for_first_diff != nmbkm_b_start) {
+          nmbkm_first_diff_for_expand = batch_mean_relative_change;
+          nmbkm_b_for_first_diff = nmbkm_b_start;
+        }
+        expand_thr = std::max(nmbkm_first_diff_for_expand / 2.f, EARLY_FINISH_THRESHOLD);
+      } else {
+        nmbkm_b_for_first_diff = -1;
+      }
+
       int64_t b_next = b;
       if (OB_SUCC(ret) && !NMBKM_FORCE_FULL_BATCH && b < n) {
         const bool have_ratio = (min_sigma_over_p < FLT_MAX);
         if ((have_ratio && min_sigma_over_p > NMBKM_RHO) || !have_ratio) {
-          b_next = std::min(b * 2, n);
+          b_next = nmbkm_next_batch_size(b, n);
         }
       }
       const int64_t b_after_rho_rule = b_next;
       bool forced_expand_for_low_batch_diff = false;
       if (OB_SUCC(ret) && !NMBKM_FORCE_FULL_BATCH && b < n && b_next == b) {
-        if (iter > 0 && batch_mean_relative_change <= EARLY_FINISH_THRESHOLD) {
-          const int64_t doubled = std::min(b * 2, n);
-          if (doubled > b) {
-            b_next = doubled;
+        if (iter > 0 && batch_mean_relative_change <= expand_thr) {
+          const int64_t next_b = nmbkm_next_batch_size(b, n);
+          if (next_b > b) {
+            b_next = next_b;
             forced_expand_for_low_batch_diff = true;
           }
         }
       }
       b_prev = b;
       b = b_next;
+      nmbkm_b_prev_iter_start = nmbkm_b_start;
 
       if (OB_SUCC(ret)) {
         bool early_stop_by_loss_threshold = false;
@@ -1810,14 +1845,34 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
         }
         pending_stall_check_after_forced_expand = forced_expand_for_low_batch_diff;
         prev_prefix_mean_assign_distance = prefix_mean_assign_distance;
+        last_prefix_mean_assign_distance = prefix_mean_assign_distance;
+        const double imbalance_factor =
+            (b_prev > 0) ? this->calc_imbalance_factor(input_vectors, cluster_v) : 0.0;
+        const float diff = batch_mean_relative_change;
+        if (OB_NOT_NULL(kmeans_monitor_)) {
+          kmeans_monitor_->set_kmeams_monitor(iter, EARLY_FINISH_THRESHOLD, diff, imbalance_factor);
+        }
+        const int64_t iter_cost_ms = ObTimeUtility::current_time_ms() - iter_start_time;
+        const float nmbkm_log_first_expand_diff =
+            (nmbkm_b_for_first_diff == nmbkm_b_start) ? nmbkm_first_diff_for_expand : -1.f;
         kmeans_log(
-            "kmeans_nmbatch iter=%ld prefix_mean=%.6f batch_diff=%.6f b=%ld->%ld rho_would=%ld forced_low_diff=%d",
-            iter, prefix_mean_assign_distance, batch_mean_relative_change, b_prev, b, b_after_rho_rule,
-            forced_expand_for_low_batch_diff ? 1 : 0);
+            "kmeans_nmbatch iter=%ld iter_cost_ms=%ld prefix_mean=%.6f batch_diff=%.6f expand_thr=%.6f stable_b=%d "
+            "first_expand_diff=%.6f b=%ld->%ld rho_would=%ld forced_low_diff=%d early_stop=%d",
+            iter, iter_cost_ms, prefix_mean_assign_distance, batch_mean_relative_change, expand_thr,
+            nmbkm_stable_b ? 1 : 0, nmbkm_log_first_expand_diff, b_prev, b, b_after_rho_rule,
+            forced_expand_for_low_batch_diff ? 1 : 0, early_stop_by_loss_threshold ? 1 : 0);
 
         cur_idx_ = next_idx();
         if (early_stop_by_loss_threshold) {
+          LOG_INFO("finish do kmeans before all iters", K(ret), K(iter), K(prefix_mean_assign_distance), K(diff),
+                   K(imbalance_factor));
           break;
+        } else {
+          LOG_INFO("finish one iters", K(ret), K(iter), K(prefix_mean_assign_distance), K(diff), K(iter_cost_ms));
+          if (iter + 1 >= N_ITER) {
+            LOG_INFO("finish do kmeans iters", K(ret), K(iter), K(prefix_mean_assign_distance), K(diff),
+                     K(imbalance_factor));
+          }
         }
       }
     }
@@ -1839,6 +1894,13 @@ int ObElkanKmeansAlgo::do_kmeans_nested_minibatch(const ObIArray<float *> &input
     NMBKM_FREE_PTR(nearest_scratch);
     NMBKM_FREE_PTR(d2_scratch);
 #undef NMBKM_FREE_PTR
+    int64_t mem_used = ivf_build_mem_ctx_.get_all_vsag_use_mem_byte() >> 20;
+    LOG_INFO("elkan kmeans memused", K(ret), K(mem_used));
+    if (OB_SUCC(ret)) {
+      kmeans_log(
+          "kmeans summary n=%ld lists=%ld dim=%ld final_mean_dis=%.6f mem_mb=%ld",
+          input_vectors.count(), kmeans_ctx_->lists_, kmeans_ctx_->dim_, last_prefix_mean_assign_distance, mem_used);
+    }
     if (OB_SUCC(ret)) {
       status_ = FINISH;
     }
@@ -1937,23 +1999,23 @@ int ObElkanKmeansAlgo::do_kmeans(const ObIArray<float*> &input_vectors)
         }
       } // end for
 
-      // iter==0：对「当前 cur_idx_（本轮 assign 用的旧中心）」再扫一遍全量 Elkan 距离和；与 dis_obj 应对同一组中心。
-      // enable_hgraph_ 时未分配 centers_distance，不能走 Elkan 全量扫，此处跳过（dis_obj 仍为 HGraph assign 的均值）。
-      if (iter == 0 && OB_NOT_NULL(centers_distance)) {
-        const int64_t sample_n = input_vectors.count();
-        if (sample_n > 0) {
-          float full_dis_sum = 0.f;
-          if (OB_SUCC(ret) && OB_FAIL(assign_vectors_parallel(input_vectors, centers_distance, nullptr, full_dis_sum,
-                                                              nullptr, nullptr, false, false))) {
-            SHARE_LOG(WARN, "elkan iter0 full_dataset loss: assign sum failed", K(ret));
-          } else if (OB_SUCC(ret)) {
-            const float mean_dis = full_dis_sum / static_cast<float>(sample_n);
-            kmeans_log(
-                "kmeans_elkan iter0 full_dataset_mean_assign_dis=%.6f n=%ld (cf dis_obj=%.6f)", mean_dis, sample_n,
-                dis_obj);
-          }
-        }
-      }
+      // // iter==0：对「当前 cur_idx_（本轮 assign 用的旧中心）」再扫一遍全量 Elkan 距离和；与 dis_obj 应对同一组中心。
+      // // enable_hgraph_ 时未分配 centers_distance，不能走 Elkan 全量扫，此处跳过（dis_obj 仍为 HGraph assign 的均值）。
+      // if (iter == 0 && OB_NOT_NULL(centers_distance)) {
+      //   const int64_t sample_n = input_vectors.count();
+      //   if (sample_n > 0) {
+      //     float full_dis_sum = 0.f;
+      //     if (OB_SUCC(ret) && OB_FAIL(assign_vectors_parallel(input_vectors, centers_distance, nullptr, full_dis_sum,
+      //                                                         nullptr, nullptr, false, false))) {
+      //       SHARE_LOG(WARN, "elkan iter0 full_dataset loss: assign sum failed", K(ret));
+      //     } else if (OB_SUCC(ret)) {
+      //       const float mean_dis = full_dis_sum / static_cast<float>(sample_n);
+      //       kmeans_log(
+      //           "kmeans_elkan iter0 full_dataset_mean_assign_dis=%.6f n=%ld (cf dis_obj=%.6f)", mean_dis, sample_n,
+      //           dis_obj);
+      //     }
+      //   }
+      // }
 
       // 4. check finish && switch center buffer
       if (OB_SUCC(ret)) {
