@@ -2,6 +2,7 @@ import concurrent
 import hashlib
 import logging
 import re
+import time
 import traceback
 from enum import Enum, auto
 
@@ -202,6 +203,15 @@ class CaseRunner(BaseModel):
                     )
                 else:
                     log.info("Data loading skipped")
+            elif TaskStage.OPTIMIZE in self.config.stages:
+                build_dur = self._optimize()
+                m.insert_duration = 0.0
+                m.optimize_duration = round(build_dur, 4)
+                m.load_duration = round(build_dur, 4)
+                log.info(
+                    f"Index rebuild only: optimize_duration={m.optimize_duration}s "
+                    f"(load_duration set to same for insert+optimize semantics)"
+                )
             if TaskStage.SEARCH_SERIAL in self.config.stages or TaskStage.SEARCH_CONCURRENT in self.config.stages:
                 self._init_search_runner()
                 if TaskStage.SEARCH_CONCURRENT in self.config.stages:
@@ -287,10 +297,12 @@ class CaseRunner(BaseModel):
         finally:
             self.stop()
 
-    @utils.time_it
-    def _optimize_task(self) -> None:
+    def _optimize_task(self) -> tuple[None, float]:
+        t0 = time.perf_counter()
         with self.db.init():
             self.db.optimize(data_size=self.ca.dataset.data.size)
+        wall = time.perf_counter() - t0
+        return None, utils.optimize_duration_for_metric(self.db, wall)
 
     def _optimize(self) -> float:
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:

@@ -31,6 +31,16 @@ class OceanBaseTypedDict(CommonTypedDict):
     ]
     database: Annotated[str, click.option("--database", type=str, help="DataBase name", required=True)]
     port: Annotated[int, click.option("--port", type=int, help="OceanBase port", required=True)]
+    table_name: Annotated[
+        str,
+        click.option(
+            "--table-name",
+            type=str,
+            default="items",
+            show_default=True,
+            help="Table for vector column (per-dataset). Override with env OB_TABLE_NAME in shell wrapper.",
+        ),
+    ]
 
 
 class OceanBaseHNSWTypedDict(CommonTypedDict, OceanBaseTypedDict, HNSWFlavor4): ...
@@ -50,6 +60,7 @@ def OceanBaseHNSW(**parameters: Unpack[OceanBaseHNSWTypedDict]):
             host=parameters["host"],
             port=parameters["port"],
             database=parameters["database"],
+            collection_name=parameters["table_name"],
         ),
         db_case_config=OceanBaseHNSWConfig(
             m=parameters["m"],
@@ -88,6 +99,7 @@ def OceanBaseIVF(**parameters: Unpack[OceanBaseIVFTypedDict]):
             host=parameters["host"],
             port=parameters["port"],
             database=parameters["database"],
+            collection_name=parameters["table_name"],
         ),
         db_case_config=OceanBaseIVFConfig(
             m=input_m,

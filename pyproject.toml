@@ -19,7 +19,7 @@ description = "VectorDBBench is not just an offering of benchmark results for ma
 
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",

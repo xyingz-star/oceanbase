@@ -11,7 +11,7 @@ import numpy as np
 from vectordb_bench.backend.clients import api
 from vectordb_bench.backend.dataset import DatasetManager
 from vectordb_bench.backend.filter import Filter, non_filter
-from vectordb_bench.backend.utils import time_it
+from vectordb_bench.backend.utils import optimize_duration_for_metric, time_it
 from vectordb_bench.metric import Metric
 
 from .mp_runner import MultiProcessingSearchRunner
@@ -86,13 +86,16 @@ class ReadWriteRunner(MultiProcessingSearchRunner, RatedMultiThreadingInsertRunn
             filters=filters,
         )
 
-    @time_it
     def run_optimize(self):
         """Optimize needs to run in differenct process for pymilvus schema recursion problem"""
+        log.info("Search after write - Optimize start")
+        t0 = time.perf_counter()
         with self.db.init():
-            log.info("Search after write - Optimize start")
             self.db.optimize(data_size=self.data_volume)
-            log.info("Search after write - Optimize finished")
+        wall = time.perf_counter() - t0
+        dur = optimize_duration_for_metric(self.db, wall)
+        log.info("Search after write - Optimize finished")
+        return None, dur
 
     def run_search(self, perc: int):
         log.info("Search after write - Serial search start")

@@ -11,6 +11,7 @@ class OceanBaseConfigDict(TypedDict):
     port: str
     password: str
     database: str
+    collection_name: str
 
 
 class OceanBaseConfig(DBConfig):
@@ -19,6 +20,8 @@ class OceanBaseConfig(DBConfig):
     host: str
     port: int
     database: str
+    # Passed to OceanBase client as MySQL table name (task_runner pops this for init_cls).
+    collection_name: str = "items"
 
     def to_dict(self) -> OceanBaseConfigDict:
         user_str = self.user.get_secret_value()
@@ -29,6 +32,7 @@ class OceanBaseConfig(DBConfig):
             "port": self.port,
             "password": pwd_str,
             "database": self.database,
+            "collection_name": self.collection_name,
         }
 
 

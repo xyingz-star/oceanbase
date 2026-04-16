@@ -1,5 +1,6 @@
 import time
 from functools import wraps
+from typing import Any
 
 
 def numerize(n: int) -> str:
@@ -45,6 +46,17 @@ def time_it(func: any):
         return result, delta
 
     return inner
+
+
+def optimize_duration_for_metric(db: Any, wall_seconds: float) -> float:
+    """Duration stored as VectorDBBench ``optimize_duration``.
+
+    Clients may set ``reported_optimize_duration_s`` to a narrower step (e.g. OceanBase:
+    only ``CREATE VECTOR INDEX``) while still performing extra work afterward; otherwise
+    the full wall time of ``optimize()`` is used.
+    """
+    v = getattr(db, "reported_optimize_duration_s", None)
+    return float(v) if v is not None else float(wall_seconds)
 
 
 def compose_train_files(train_count: int, use_shuffled: bool) -> list[str]:

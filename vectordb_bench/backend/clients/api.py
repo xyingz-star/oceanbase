@@ -93,6 +93,9 @@ class DBConfig(ABC, BaseModel):
     def not_empty_field(cls, v: any, field: any):
         if field.name in cls.common_short_configs() or field.name in cls.common_long_configs():
             return v
+        # MySQL-compatible clients (e.g. OceanBase) often use an empty tenant password in dev.
+        if field.name == "password":
+            return v
         if not v and isinstance(v, str | SecretStr):
             raise ValueError("Empty string!")
         return v

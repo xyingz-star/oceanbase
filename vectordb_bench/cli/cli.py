@@ -132,12 +132,17 @@ def parse_task_stages(
     load: bool,
     search_serial: bool,
     search_concurrent: bool,
+    rebuild_index: bool = False,
 ) -> list[TaskStage]:
     stages = []
     if load and not drop_old:
         raise RuntimeError("Dropping old data cannot be skipped if loading data")
     if drop_old and not load:
         raise RuntimeError("Load cannot be skipped if dropping old data")
+    if rebuild_index and load:
+        raise RuntimeError("--rebuild-index requires --skip-load; full --load already builds the index")
+    if rebuild_index and not load:
+        stages.append(TaskStage.OPTIMIZE)
     if drop_old:
         stages.append(TaskStage.DROP_OLD)
     if load:
@@ -249,6 +254,16 @@ class CommonTypedDict(TypedDict):
             default=True,
             help="Search concurrent or skip",
             show_default=True,
+        ),
+    ]
+    rebuild_index: Annotated[
+        bool,
+        click.option(
+            "--rebuild-index/--skip-rebuild-index",
+            type=bool,
+            default=False,
+            show_default=True,
+            help="With --skip-load: drop existing vector index (OceanBase idx1), rebuild index, record optimize time; table data unchanged",
         ),
     ]
     case_type: Annotated[
@@ -642,6 +657,7 @@ def run(
             parameters["load"],
             parameters["search_serial"],
             parameters["search_concurrent"],
+            parameters["rebuild_index"],
         ),
     )
     task_label = parameters["task_label"]

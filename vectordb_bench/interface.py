@@ -192,8 +192,8 @@ class BenchMarkRunner:
                     cached_load_duration = case_res.metrics.load_duration if drop_old else cached_load_duration
 
                     # use the cached load duration if this case didn't drop the existing collection
-                    if not drop_old:
-                        case_res.metrics.load_duration = cached_load_duration if cached_load_duration else 0.0
+                    if not drop_old and cached_load_duration is not None:
+                        case_res.metrics.load_duration = cached_load_duration
                 except (LoadTimeoutError, PerformanceTimeoutError) as e:
                     log.warning(f"[{idx+1}/{num_cases}] case {runner.display()} failed to run, reason={e}")
                     case_res.label = ResultLabel.OUTOFRANGE

@@ -85,6 +85,7 @@ def Endee(**parameters):
         parameters["load"],
         parameters["search_serial"],
         parameters["search_concurrent"],
+        parameters.get("rebuild_index", False),
     )
 
     # Generate a random collection name if not provided
