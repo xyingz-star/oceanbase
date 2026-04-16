@@ -1,0 +1,110 @@
+# 向量表 768D1M 导入 - 逐条命令行指令
+# 连接：-h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c
+# 按顺序复制到终端执行即可；如需改主机/端口/库，替换对应参数。
+#
+# ----------------------------------------------------------------------
+# 【重要】设置 secure_file_priv（解决 ERROR 9731 / direct path access）
+# 仅支持通过 Unix 套接字在本机修改，远程 TCP 会报：
+#   ERROR 1235: modify SECURE_FILE_PRIV not by unix socket connection not supported
+#
+# 【Unix 套接字连接具体实现】
+#
+# 步骤 1：SSH 登录到运行 OceanBase observer 的那台机器（即 11.162.218.163 或你实际部署的节点）。
+#
+# 步骤 2：找到 MySQL Unix socket 文件路径。
+#   - 源码里 observer 默认监听的是「工作目录下的 run/sql.sock」，即 <observer 进程的工作目录>/run/sql.sock。
+#   - 在服务器上执行下面任一方式定位：
+#       ls -la /path/to/observer/run/sql.sock
+#       或：find /home /opt /data -name "sql.sock" 2>/dev/null
+#       或：若用 OBD 部署，看配置里 data_dir / home_path，socket 一般在 <home_path>/run/sql.sock。
+#
+# 步骤 3：用 -S 指定 socket 连接（不要用 -h/-P，否则仍是 TCP）。
+#   - 使用 obclient（OceanBase 客户端）：
+#       obclient -S /绝对路径/run/sql.sock -uroot@mysql_tenant -Dtest -p'你的密码' -e "SET GLOBAL secure_file_priv='/data/zhuxueying.zxy/vec_data';"
+#   - 或使用 mysql 客户端（若已安装且兼容）：
+#       mysql -S /绝对路径/run/sql.sock -uroot@mysql_tenant -Dtest -p -e "SET GLOBAL secure_file_priv='/data/zhuxueying.zxy/vec_data';"
+#   - -S 与路径之间可加空格也可不加（-S/path 或 -S /path 均可）。
+#
+# 步骤 4：设置成功后，退出 SSH，在本地用原来的 TCP 方式执行下面的建表与导入即可。
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# 1. 删除外部表（若存在）
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -e 'DROP TABLE IF EXISTS ex_vec_768d1m;'
+
+# ----------------------------------------------------------------------
+# 2. 创建外部表
+# ----------------------------------------------------------------------
+# PATTERN 为正则：768D1M 若为单文件 shuffle_train.parquet 用 'shuffle_train\.parquet'；768D10M 等分片为 shuffle_train-00-of-10.parquet 等，需用 'shuffle_train.*\.parquet' 匹配所有分片
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -e "CREATE EXTERNAL TABLE ex_vec_768d1m (id bigint, emb ARRAY(DOUBLE)) location='file:///data/zhuxueying.zxy/vec_data/768D1M' format (type = 'PARQUET') PATTERN = 'shuffle_train.parquet';"
+
+# ----------------------------------------------------------------------
+# 3. 删除内部表（若存在）
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -e 'DROP TABLE IF EXISTS vec_768d1m;'
+
+# ----------------------------------------------------------------------
+# 4. 创建内部向量表
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -e 'CREATE TABLE vec_768d1m (id bigint, embedding VECTOR(768)) partition by hash(id) partitions 16;'
+
+# ----------------------------------------------------------------------
+# 5. 查外部表行数（可选）
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -N -e 'SELECT COUNT(*) FROM ex_vec_768d1m'
+
+# ----------------------------------------------------------------------
+# 6. 从外部表导入到内部表
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -e 'INSERT /*+ parallel(2) append enable_parallel_dml */ INTO vec_768d1m (id, embedding) SELECT id, emb FROM ex_vec_768d1m ORDER BY id LIMIT 1000000;'
+
+# ----------------------------------------------------------------------
+# 7. 查内部表行数（校验）
+# ----------------------------------------------------------------------
+mysql -h11.162.218.163 -P2886 -uroot@mysql_tenant -Dtest -A -c -N -e 'SELECT COUNT(*) FROM vec_768d1m'
+
+# ======================================================================
+# 【768D10M】数量不是 10M 的常见原因：PATTERN 未匹配到分片文件
+# 目录 768D10M 下实际是 shuffle_train-00-of-10.parquet ~ shuffle_train-09-of-10.parquet，
+# 若 PATTERN = 'shuffle_train.parquet'（精确匹配单文件），则匹配数为 0，COUNT(*) 为 0。
+# 解决：建外部表时 PATTERN 改为正则，匹配所有分片，例如：
+#   PATTERN = 'shuffle_train.*\.parquet'
+# 并确保 location 指向 768D10M、INSERT 使用 LIMIT 10000000。
+# ======================================================================
+# 示例 - 768D10M 外部表（匹配 10 个 parquet 分片）：
+# DROP TABLE IF EXISTS ex_vec_768d10m;
+# CREATE EXTERNAL TABLE ex_vec_768d10m (id bigint, emb ARRAY(DOUBLE)) location='file:///data/zhuxueying.zxy/vec_data/768D10M' format (type = 'PARQUET') PATTERN = 'shuffle_train.*\.parquet';
+# SELECT COUNT(*) FROM ex_vec_768d10m;   -- 应接近 10000000
+# 内部表与导入（表名/limit 按需替换）：
+# CREATE TABLE vec_768d10m (id bigint, embedding VECTOR(768)) partition by hash(id) partitions 16;
+# INSERT /*+ parallel(2) append enable_parallel_dml */ INTO vec_768d10m (id, embedding) SELECT id, emb FROM ex_vec_768d10m ORDER BY id LIMIT 10000000;
+# SELECT COUNT(*) FROM vec_768d10m;
+#
+# ======================================================================
+# 【ERROR 4013: No memory or reach tenant memory limit】处理办法
+# 10M 条 768 维向量一次性 INSERT + ORDER BY 会占用较多工作内存，易触发租户内存上限。
+# ======================================================================
+#
+# 方案一：增大租户内存（需用 sys 租户执行）
+# 1）查当前租户使用的 unit 及规格（在 sys 租户下）：
+#     SELECT t.tenant_name, u.unit_config_name, u.max_memory
+#     FROM oceanbase.__all_tenant t, oceanbase.__all_resource_pool p, oceanbase.__all_unit_config u
+#     WHERE t.tenant_id = p.tenant_id AND p.unit_config_id = u.unit_config_id AND t.tenant_name = 'mysql_tenant';
+# 2）若当前为 2c4g（4G），可改为更大规格或新建 unit 并改 pool：
+#     CREATE RESOURCE UNIT big_unit max_cpu 4, memory_size '16G';   -- 新建 16G 规格
+#     ALTER RESOURCE POOL pool_mysql_tenant_unit_num_xxx unit = 'big_unit';  -- 将 mysql_tenant 的 pool 改为 big_unit（具体 pool 名以步骤 1 查询为准）
+#     -- 或直接改现有 unit 的 memory_size（若版本支持）：
+#     ALTER RESOURCE UNIT 2c4g memory_size = 17179869184;   -- 16G，单位字节
+# 建议：10M 条 768 维向量导入，租户可用内存建议 >= 8G（若开并行则 16G 更稳）。
+#
+# 方案二：降低单次内存占用（不改租户规格）
+# - 降低并行度，避免多 worker 同时占满内存：
+#   INSERT /*+ parallel(1) append enable_parallel_dml */ INTO vec_768d10m (id, embedding) SELECT id, emb FROM ex_vec_768d10m ORDER BY id LIMIT 10000000;
+# - 或分批导入（每次 100 万行，执行 10 次，注意避免重复插入）：
+#   INSERT /*+ append */ INTO vec_768d10m (id, embedding) SELECT id, emb FROM ex_vec_768d10m ORDER BY id LIMIT 1000000 OFFSET 0;   -- 第 1 批
+#   INSERT /*+ append */ INTO vec_768d10m (id, embedding) SELECT id, emb FROM ex_vec_768d10m ORDER BY id LIMIT 1000000 OFFSET 1000000;  -- 第 2 批（需外部表支持 OFFSET 或改用 id 范围）
+#   若外部表/引擎不支持 OFFSET，可用脚本循环：多次 INSERT...LIMIT 1000000，并在应用层记录已导入的 id 范围或行数，下一批用 WHERE id > ? 等方式切分。
+#
+# 方案三：调小 SQL 工作区（可能缓解，不一定根除）
+#   SET GLOBAL ob_sql_work_area_percentage = 10;   -- 在 mysql_tenant 下执行，降低 work area 占比

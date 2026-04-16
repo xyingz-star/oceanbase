@@ -227,8 +227,12 @@ protected:
 
 private:
   int do_kmeans_nested_minibatch(const ObIArray<float*> &input_vectors);
+  int nmbkm_postprocess_pca_fill_empty_centers(const ObIArray<float *> &input_vectors, int32_t *data_cnt_in_cluster,
+      float *centers_distance, int32_t *nearest_labels_opt = nullptr,
+      int64_t nmbkm_batch_for_sparse_thr = -1);
   int search_nearest_center(const ObIArray<float *> &input_vectors, float *centers_distance,
-                            int32_t *data_cnt_in_cluster, float &dis_obj);
+                            int32_t *data_cnt_in_cluster, float &dis_obj,
+                            int32_t *nearest_label_out = nullptr);
   int assign_vectors_parallel(const ObIArray<float *> &input_vectors, float *centers_distance,
                               int32_t *data_cnt_in_cluster, float &dis_obj,
                               int32_t *nearest_label_out = nullptr,
