@@ -35,6 +35,10 @@
  #include <vector>
  #include <unistd.h>
  #include <pwd.h>
+ #include <cstdint>
+ #include <cstring>
+ #include <strings.h>
+ #include <sys/stat.h>
  
  namespace oceanbase {
  using namespace common;
@@ -44,7 +48,7 @@
  // K-means schedule after ObKmeansCtx::init(). Edit only this file to switch A/B without touching headers
  // (rebuild stays limited to this translation unit). ObSingleKmeansExecutor::init still may call
  // set_kmeans_train_strategy() after init() to override.
- constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_NMBKM;//KTS_FULL_BATCH;//KTS_NMBKM;
+ constexpr ObKmeansTrainStrategy KMEANS_INIT_DEFAULT_TRAIN_STRATEGY = KTS_FULL_BATCH;//KTS_FULL_BATCH;//KTS_NMBKM;
  // NMBKM only: b=n from start, no doubling (full-batch assignment size). Kept in .cpp so toggling does not recompile dependents of the header.
  constexpr bool NMBKM_FORCE_FULL_BATCH = false;//true;
  // Default divisor for initial NMBKM prefix: b0 = max(1, n / div). Runtime overrides (each kmeans entry):
@@ -339,6 +343,218 @@
        q3,
        max_c);
  }
+ }  // namespace
+
+ namespace {
+ // Default dev layout: $HOME/test/flash-kmeans (Python venv) + $HOME/test/oceanbase/tools/ob_external_kmeans_worker.py
+ // Disable with OB_USE_TEST_FLASH_KMEANS=0 or false. Override command with OB_EXTERNAL_KMEANS_CMD.
+ char g_ob_default_ext_kmeans_cmd[2048];
+ bool g_ob_default_ext_kmeans_cmd_built = false;
+
+ const char *ob_get_external_kmeans_cmd_or_default()
+ {
+   const char *manual = ::getenv("OB_EXTERNAL_KMEANS_CMD");
+   if (OB_NOT_NULL(manual) && manual[0] != '\0') {
+     return manual;
+   }
+   if (!g_ob_default_ext_kmeans_cmd_built) {
+     g_ob_default_ext_kmeans_cmd_built = true;
+     g_ob_default_ext_kmeans_cmd[0] = '\0';
+     const char *home = ::getenv("HOME");
+     if (OB_NOT_NULL(home) && home[0] != '\0') {
+       char py[512];
+       char wk[512];
+       const int nw = snprintf(wk, sizeof(wk), "%s/test/oceanbase/tools/ob_external_kmeans_worker.py", home);
+       if (nw > 0 && nw < static_cast<int>(sizeof(wk)) && 0 == ::access(wk, R_OK)) {
+         int npy = snprintf(py, sizeof(py), "%s/test/flash-kmeans/.venv311/bin/python3", home);
+         if (npy <= 0 || npy >= static_cast<int>(sizeof(py)) || 0 != ::access(py, X_OK)) {
+           (void)snprintf(py, sizeof(py), "%s/test/flash-kmeans/.venv/bin/python3", home);
+         }
+         if (0 == ::access(py, X_OK)) {
+           const int nc = snprintf(g_ob_default_ext_kmeans_cmd,
+               sizeof(g_ob_default_ext_kmeans_cmd),
+               "%s %s",
+               py,
+               wk);
+           if (nc <= 0 || nc >= static_cast<int>(sizeof(g_ob_default_ext_kmeans_cmd))) {
+             g_ob_default_ext_kmeans_cmd[0] = '\0';
+           }
+         }
+       }
+     }
+   }
+   return (g_ob_default_ext_kmeans_cmd[0] != '\0') ? g_ob_default_ext_kmeans_cmd : nullptr;
+ }
+
+ ObKmeansAlgoType ob_resolve_kmeans_algo_type_from_env()
+ {
+   const char *opt_out = ::getenv("OB_USE_TEST_FLASH_KMEANS");
+   if (OB_NOT_NULL(opt_out) && opt_out[0] != '\0') {
+     if ((0 == strcmp(opt_out, "0")) || (0 == strcasecmp(opt_out, "false")) || (0 == strcasecmp(opt_out, "off"))) {
+       return ObKmeansAlgoType::KAT_ELKAN;
+     }
+   }
+   if (OB_NOT_NULL(ob_get_external_kmeans_cmd_or_default())) {
+     return ObKmeansAlgoType::KAT_EXTERNAL_GPU;
+   }
+   return ObKmeansAlgoType::KAT_ELKAN;
+ }
+
+ constexpr uint32_t OB_EXT_KMEANS_MAGIC = 0x4D4B424FU;  // 'OBKM' LE
+ constexpr uint32_t OB_EXT_KMEANS_VERSION = 1U;
+ constexpr uint32_t OB_EXT_KMEANS_FLAG_HAS_INIT_CENTERS = 1U << 0;
+ // Worker-side k-means++ init flag; default ON (set OB_EXTERNAL_GPU_KMEANSPP=0|false|off|no to use OB CPU k-means++).
+ // Must match tools/ob_external_kmeans_worker.py
+ constexpr uint32_t OB_EXT_KMEANS_FLAG_WORKER_GPU_KMEANSPP = 1U << 1;
+
+#pragma pack(push, 1)
+ struct ObExtKmeansInHeader
+ {
+   uint32_t magic_;
+   uint32_t version_;
+   int64_t n_samples_;
+   int64_t dim_;
+   int64_t k_;
+   int32_t max_iters_;
+   int32_t dist_algo_;
+   uint32_t flags_;
+ };
+ struct ObExtKmeansOutHeader
+ {
+   uint32_t magic_;
+   uint32_t version_;
+   int64_t k_;
+   int64_t dim_;
+ };
+#pragma pack(pop)
+
+ int ob_external_kmeans_max_iters_from_env()
+ {
+   const char *e = ::getenv("OB_EXTERNAL_KMEANS_MAX_ITERS");
+   if (OB_NOT_NULL(e) && e[0] != '\0') {
+     const int v = atoi(e);
+     if (v > 0 && v <= 10000) {
+       return v;
+     }
+   }
+   return 100;
+ }
+
+ bool ob_external_gpu_kmeanspp_enabled()
+ {
+   const char *e = ::getenv("OB_EXTERNAL_GPU_KMEANSPP");
+   if (OB_NOT_NULL(e) && e[0] != '\0') {
+     if ((0 == strcmp(e, "0")) || (0 == strcasecmp(e, "false")) || (0 == strcasecmp(e, "off")) ||
+         (0 == strcasecmp(e, "no"))) {
+       return false;
+     }
+   }
+   return true;
+ }
+
+ int write_ob_external_kmeans_input(
+     const char *path,
+     const ObIArray<float *> &input_vectors,
+     const ObCentersBuffer<float> &init_centers,
+     const int64_t k,
+     const int64_t dim,
+     const int32_t dist_algo,
+     const int max_iters,
+     const bool write_init,
+     const bool worker_gpu_kmeanspp)
+ {
+   int ret = OB_SUCCESS;
+   FILE *fp = fopen(path, "wb");
+   if (OB_ISNULL(fp)) {
+     ret = OB_IO_ERROR;
+     SHARE_LOG(WARN, "fopen input failed", K(ret), KP(path));
+   } else {
+     ObExtKmeansInHeader hdr;
+     hdr.magic_ = OB_EXT_KMEANS_MAGIC;
+     hdr.version_ = OB_EXT_KMEANS_VERSION;
+     hdr.n_samples_ = input_vectors.count();
+     hdr.dim_ = dim;
+     hdr.k_ = k;
+     hdr.max_iters_ = max_iters;
+     // Must match tools/ob_external_kmeans_worker.py / ObVectorIndexDistAlgorithm (VIDA_L2=0, VIDA_IP=1, VIDA_COS=2).
+     hdr.dist_algo_ = dist_algo;
+     if (worker_gpu_kmeanspp) {
+       hdr.flags_ = OB_EXT_KMEANS_FLAG_WORKER_GPU_KMEANSPP;
+     } else {
+       hdr.flags_ = write_init ? OB_EXT_KMEANS_FLAG_HAS_INIT_CENTERS : 0U;
+     }
+     if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
+       ret = OB_IO_ERROR;
+       SHARE_LOG(WARN, "fwrite header failed", K(ret));
+     }
+     for (int64_t i = 0; OB_SUCC(ret) && i < input_vectors.count(); ++i) {
+       if (fwrite(input_vectors.at(i), sizeof(float) * static_cast<size_t>(dim), 1, fp) != 1) {
+         ret = OB_IO_ERROR;
+         SHARE_LOG(WARN, "fwrite sample failed", K(ret), K(i));
+       }
+     }
+     if (OB_SUCC(ret) && write_init && !worker_gpu_kmeanspp) {
+       for (int64_t c = 0; OB_SUCC(ret) && c < k; ++c) {
+         if (fwrite(init_centers.at(c), sizeof(float) * static_cast<size_t>(dim), 1, fp) != 1) {
+           ret = OB_IO_ERROR;
+           SHARE_LOG(WARN, "fwrite init center failed", K(ret), K(c));
+         }
+       }
+     }
+     if (0 != fclose(fp)) {
+       ret = OB_SUCC(ret) ? OB_IO_ERROR : ret;
+       SHARE_LOG(WARN, "fclose input failed", K(ret));
+     }
+   }
+   return ret;
+ }
+
+ void ob_external_kmeans_log_config(
+     const bool gpu_kpp, const bool write_init, const int max_iters, const char *cmd)
+ {
+   const uint32_t bin_flags = gpu_kpp ? OB_EXT_KMEANS_FLAG_WORKER_GPU_KMEANSPP
+                                      : (write_init ? OB_EXT_KMEANS_FLAG_HAS_INIT_CENTERS : 0U);
+   const char *kpp_env = ::getenv("OB_EXTERNAL_GPU_KMEANSPP");
+   const char *manual_cmd = ::getenv("OB_EXTERNAL_KMEANS_CMD");
+   const char *opt_flash = ::getenv("OB_USE_TEST_FLASH_KMEANS");
+   const char *flash_env = ::getenv("USE_FLASH_KMEANS");
+   const char *cuda_vis = ::getenv("CUDA_VISIBLE_DEVICES");
+   const char *kpp_seed = ::getenv("OB_KMEANSPP_SEED");
+   char cmd_short[400];
+   cmd_short[0] = '\0';
+   if (OB_NOT_NULL(cmd) && cmd[0] != '\0') {
+     const size_t len = strlen(cmd);
+     const size_t max_show = 320;
+     if (len <= max_show) {
+       (void)snprintf(cmd_short, sizeof(cmd_short), "%s", cmd);
+     } else {
+       (void)snprintf(cmd_short, sizeof(cmd_short), "%.*s...", static_cast<int>(max_show), cmd);
+     }
+   }
+   kmeans_log(
+       "external_kmeans_config gpu_kpp=%d write_init=%d bin_flags=0x%x max_iters=%d "
+       "OB_EXTERNAL_GPU_KMEANSPP=%s OB_EXTERNAL_KMEANS_CMD=%s OB_USE_TEST_FLASH_KMEANS=%s USE_FLASH_KMEANS=%s "
+       "CUDA_VISIBLE_DEVICES=%s OB_KMEANSPP_SEED=%s worker_cmd=%s",
+       gpu_kpp ? 1 : 0,
+       write_init ? 1 : 0,
+       bin_flags,
+       max_iters,
+       OB_NOT_NULL(kpp_env) && kpp_env[0] != '\0' ? kpp_env : "(unset_default_worker_kpp)",
+       OB_NOT_NULL(manual_cmd) && manual_cmd[0] != '\0' ? manual_cmd : "(unset)",
+       OB_NOT_NULL(opt_flash) && opt_flash[0] != '\0' ? opt_flash : "(unset)",
+       OB_NOT_NULL(flash_env) && flash_env[0] != '\0' ? flash_env : "(unset)",
+       OB_NOT_NULL(cuda_vis) && cuda_vis[0] != '\0' ? cuda_vis : "(unset)",
+       OB_NOT_NULL(kpp_seed) && kpp_seed[0] != '\0' ? kpp_seed : "(unset)",
+       cmd_short[0] != '\0' ? cmd_short : "(null)");
+   SHARE_LOG(INFO,
+       "external kmeans config",
+       K(gpu_kpp),
+       K(write_init),
+       K(bin_flags),
+       K(max_iters),
+       KP(cmd));
+ }
+
  }  // namespace
  // ------------------ ObKmeansCtx implement ------------------
  void ObKmeansCtx::destroy()
@@ -946,6 +1162,10 @@
    if (OB_FAIL(ctx_.init(tenant_id, lists, samples_per_nlist, dim, dist_algo, norm_info, 1 /*pq_m*/, false /* is_pq_stage */))) {
      LOG_WARN("fail to init kmeans ctx", K(ret), K(tenant_id), K(lists), K(samples_per_nlist), K(dim), K(dist_algo));
    } else {
+     if (algo_type == ObKmeansAlgoType::KAT_EXTERNAL_GPU) {
+       ctx_.set_train_strategy(KTS_FULL_BATCH);
+       kmeans_log("external_kmeans: train_strategy set to FULL_BATCH (external worker does not support NMBKM)");
+     }
      if (algo_type == ObKmeansAlgoType::KAT_ELKAN) {
        void *tmp_buf = nullptr;
        if (OB_ISNULL(tmp_buf = ivf_build_mem_ctx_.Allocate(sizeof(ObElkanKmeansAlgo)))) {
@@ -953,6 +1173,14 @@
          LOG_WARN("failed to alloc tmp_buf", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
        } else {
          algo_ = new (tmp_buf) ObElkanKmeansAlgo(ivf_build_mem_ctx_);
+       }
+     } else if (algo_type == ObKmeansAlgoType::KAT_EXTERNAL_GPU) {
+       void *tmp_buf = nullptr;
+       if (OB_ISNULL(tmp_buf = ivf_build_mem_ctx_.Allocate(sizeof(ObExternalGpuKmeansAlgo)))) {
+         ret = OB_ALLOCATE_MEMORY_FAILED;
+         LOG_WARN("failed to alloc tmp_buf for external kmeans", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
+       } else {
+         algo_ = new (tmp_buf) ObExternalGpuKmeansAlgo(ivf_build_mem_ctx_);
        }
      } else {
        ret = OB_INVALID_ARGUMENT;
@@ -1062,6 +1290,10 @@
    if (OB_FAIL(ctx_.init(tenant_id, lists, samples_per_nlist, dim, dist_algo, norm_info, pq_m_size, true /* is_pq_stage */))) {
      LOG_WARN("fail to init kmeans ctx", K(ret), K(tenant_id), K(lists), K(samples_per_nlist), K(dim), K(dist_algo));
    } else {
+     if (algo_type == ObKmeansAlgoType::KAT_EXTERNAL_GPU) {
+       ctx_.set_train_strategy(KTS_FULL_BATCH);
+       kmeans_log("external_kmeans: train_strategy set to FULL_BATCH (external worker does not support NMBKM)");
+     }
      pq_m_size_ = pq_m_size;
      if (OB_FAIL(algos_.prepare_allocate(pq_m_size))) {
        LOG_WARN("fail to reserve space", K(ret), K(pq_m_size));
@@ -1075,6 +1307,14 @@
            LOG_WARN("failed to alloc tmp_buf", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
          } else {
            algos_[i] = new (tmp_buf) ObElkanKmeansAlgo(ivf_build_mem_ctx_);
+         }
+       } else if (algo_type == ObKmeansAlgoType::KAT_EXTERNAL_GPU) {
+         void *tmp_buf = nullptr;
+         if (OB_ISNULL(tmp_buf = ivf_build_mem_ctx_.Allocate(sizeof(ObExternalGpuKmeansAlgo)))) {
+           ret = OB_ALLOCATE_MEMORY_FAILED;
+           LOG_WARN("failed to alloc tmp_buf for external kmeans", K(ret), K(ivf_build_mem_ctx_.get_all_vsag_use_mem_byte()));
+         } else {
+           algos_[i] = new (tmp_buf) ObExternalGpuKmeansAlgo(ivf_build_mem_ctx_);
          }
        } else {
          ret = OB_INVALID_ARGUMENT;
@@ -1414,6 +1654,226 @@
        LOG_WARN("index out of range", K(ret), K(centers_count), K(pos), K(algo->get_cur_centers().count()));
      } else {
        center_vector = algo->get_cur_centers().at(pos % centers_count);
+     }
+   }
+   return ret;
+ }
+ 
+ // ------------------ ObExternalGpuKmeansAlgo (out-of-process k-means) ------------------
+ int ObExternalGpuKmeansAlgo::init_first_center(const ObIArray<float *> &input_vectors)
+ {
+   int ret = OB_SUCCESS;
+   if (ob_external_gpu_kmeanspp_enabled()) {
+     if (PREPARE_CENTERS != status_) {
+       ret = OB_STATE_NOT_MATCH;
+       SHARE_LOG(WARN, "status not match", K(ret), K(status_));
+     } else {
+       const int64_t center_init_cost_ms = ObTimeUtility::current_time_ms() - center_init_start_ms_;
+       status_ = RUNNING_KMEANS;
+       kmeans_log(
+           "center_init_finished gpu_kmeanspp_skip_cpu center_init_cost_ms=%ld (default worker k-means++; set OB_EXTERNAL_GPU_KMEANSPP=0 for OB CPU k-means++)",
+           center_init_cost_ms);
+       SHARE_LOG(INFO, "external kmeans: skip CPU k-means++ init; worker runs k-means++ on GPU", K(ret));
+     }
+   } else {
+     ret = ObKmeansAlgo::init_first_center(input_vectors);
+   }
+   return ret;
+ }
+ 
+ int ObExternalGpuKmeansAlgo::do_kmeans(const ObIArray<float *> &input_vectors)
+ {
+   int ret = OB_SUCCESS;
+   char in_template[] = "/tmp/ob_ext_km_in_XXXXXX";
+   char out_template[] = "/tmp/ob_ext_km_out_XXXXXX";
+   int in_fd = ::mkstemp(in_template);
+   int out_fd = ::mkstemp(out_template);
+   std::vector<float> row_buf;
+   if (RUNNING_KMEANS != status_) {
+     ret = OB_STATE_NOT_MATCH;
+     SHARE_LOG(WARN, "status not match", K(ret), K(status_));
+     kmeans_log("external_kmeans_skip reason=bad_status status=%d", static_cast<int>(status_));
+   } else if (OB_UNLIKELY(kmeans_ctx_->get_train_strategy() == KTS_NMBKM)) {
+     ret = OB_NOT_SUPPORTED;
+     SHARE_LOG(WARN, "external kmeans does not support NMBKM train strategy", K(ret));
+     kmeans_log("external_kmeans_skip reason=nmbkm_not_supported");
+   } else if (in_fd < 0 || out_fd < 0) {
+     ret = OB_IO_ERROR;
+     SHARE_LOG(WARN, "mkstemp failed", K(ret), K(in_fd), K(out_fd));
+     kmeans_log("external_kmeans_fail reason=mkstemp in_fd=%d out_fd=%d", in_fd, out_fd);
+   } else {
+     ::close(out_fd);
+     out_fd = -1;
+     const char *cmd = ob_get_external_kmeans_cmd_or_default();
+     const int max_iters = ob_external_kmeans_max_iters_from_env();
+     const int64_t dim = kmeans_ctx_->dim_;
+     const int64_t k = kmeans_ctx_->lists_;
+     const bool gpu_kpp = ob_external_gpu_kmeanspp_enabled();
+     const bool write_init = !gpu_kpp && (centers_[cur_idx_].count() == k);
+     int64_t external_kmeans_wall_t0_ms = 0;
+     if (OB_ISNULL(cmd) || cmd[0] == '\0') {
+       ret = OB_ERR_UNEXPECTED;
+       SHARE_LOG(WARN, "external kmeans cmd empty (set OB_EXTERNAL_KMEANS_CMD or install $HOME/test/flash-kmeans + worker)",
+           K(ret));
+       kmeans_log("external_kmeans_fail reason=cmd_empty (set OB_EXTERNAL_KMEANS_CMD or default worker path)");
+     } else if (input_vectors.count() <= 0 || dim <= 0 || k <= 0) {
+       ret = OB_INVALID_ARGUMENT;
+       SHARE_LOG(WARN, "invalid n/dim/k", K(ret), K(input_vectors.count()), K(dim), K(k));
+       kmeans_log("external_kmeans_fail reason=invalid_n_dim_k n=%ld dim=%ld k=%ld",
+           input_vectors.count(), dim, k);
+     } else if (!gpu_kpp && !write_init) {
+       ret = OB_ERR_UNEXPECTED;
+       SHARE_LOG(WARN, "init centers count mismatch", K(ret), K(centers_[cur_idx_].count()), K(k));
+       kmeans_log("external_kmeans_fail reason=init_centers_mismatch have=%ld need=%ld",
+           centers_[cur_idx_].count(), k);
+     } else {
+       external_kmeans_wall_t0_ms = ObTimeUtility::current_time_ms();
+       ::close(in_fd);
+       in_fd = -1;
+       row_buf.resize(static_cast<size_t>(dim));
+       const int64_t write_input_t0_ms = ObTimeUtility::current_time_ms();
+       if (OB_FAIL(write_ob_external_kmeans_input(
+                      in_template,
+                      input_vectors,
+                      centers_[cur_idx_],
+                      k,
+                      dim,
+                      static_cast<int32_t>(kmeans_ctx_->dist_algo_),
+                      max_iters,
+                      write_init,
+                      gpu_kpp))) {
+         SHARE_LOG(WARN, "write external kmeans input failed", K(ret));
+         kmeans_log("external_kmeans_fail reason=write_input_bin ret=%d", ret);
+       } else {
+         const int64_t write_input_ms = ObTimeUtility::current_time_ms() - write_input_t0_ms;
+         kmeans_log(
+             "external_kmeans_write_input_ms=%ld in=%s",
+             write_input_ms,
+             in_template);
+         const int32_t dist_algo_i = static_cast<int32_t>(kmeans_ctx_->dist_algo_);
+         kmeans_log(
+             "external_kmeans_invoke n=%ld k=%ld dim=%ld dist_algo=%d max_iters=%d write_init=%d gpu_kmeanspp=%d in=%s out=%s",
+             input_vectors.count(),
+             k,
+             dim,
+             dist_algo_i,
+             max_iters,
+             write_init ? 1 : 0,
+             gpu_kpp ? 1 : 0,
+             in_template,
+             out_template);
+         if (OB_ISNULL(::getenv("USE_FLASH_KMEANS")) && OB_NOT_NULL(std::strstr(cmd, "flash-kmeans"))) {
+           (void)::setenv("USE_FLASH_KMEANS", "1", 0);
+         }
+         ob_external_kmeans_log_config(gpu_kpp, write_init, max_iters, cmd);
+         char cmdline[2048];
+         const int n = snprintf(cmdline,
+             sizeof(cmdline),
+             "%s \"%s\" \"%s\"",
+             cmd,
+             in_template,
+             out_template);
+         if (n <= 0 || n >= static_cast<int>(sizeof(cmdline))) {
+           ret = OB_ERR_UNEXPECTED;
+           SHARE_LOG(WARN, "kmeans cmd too long", K(ret), K(n));
+           kmeans_log("external_kmeans_fail reason=cmdline_too_long n=%d", n);
+         } else {
+           const int64_t system_t0_ms = ObTimeUtility::current_time_ms();
+           const int sys_ret = ::system(cmdline);
+           const int64_t system_elapsed_ms = ObTimeUtility::current_time_ms() - system_t0_ms;
+           kmeans_log(
+               "external_kmeans_system_return sys_ret=%d system_elapsed_ms=%ld dist_algo=%d (worker exit; 0=success)",
+               sys_ret,
+               system_elapsed_ms,
+               dist_algo_i);
+           if (sys_ret != 0) {
+             ret = OB_ERR_UNEXPECTED;
+             SHARE_LOG(WARN, "external kmeans command failed", K(ret), K(sys_ret), K(cmdline));
+             kmeans_log(
+                 "external_kmeans_fail reason=worker_nonzero_exit sys_ret=%d system_elapsed_ms=%ld",
+                 sys_ret,
+                 system_elapsed_ms);
+           }
+         }
+       }
+     }
+     if (in_fd >= 0) {
+       ::close(in_fd);
+       in_fd = -1;
+     }
+     (void)::unlink(in_template);
+ 
+     if (OB_SUCC(ret)) {
+       FILE *fp = fopen(out_template, "rb");
+       if (OB_ISNULL(fp)) {
+         ret = OB_IO_ERROR;
+         SHARE_LOG(WARN, "fopen kmeans output failed", K(ret), KP(out_template));
+         kmeans_log("external_kmeans_fail reason=fopen_output path=%s", out_template);
+       } else {
+         ObExtKmeansOutHeader hdr;
+         if (fread(&hdr, sizeof(hdr), 1, fp) != 1) {
+           ret = OB_IO_ERROR;
+           SHARE_LOG(WARN, "fread output header failed", K(ret));
+           kmeans_log("external_kmeans_fail reason=fread_output_header");
+         } else if (hdr.magic_ != OB_EXT_KMEANS_MAGIC || hdr.version_ != OB_EXT_KMEANS_VERSION) {
+           ret = OB_ERR_UNEXPECTED;
+           SHARE_LOG(WARN, "bad output header", K(ret), K(hdr.magic_), K(hdr.version_));
+           kmeans_log(
+               "external_kmeans_fail reason=bad_output_magic_ver magic=%u ver=%u",
+               hdr.magic_,
+               hdr.version_);
+         } else if (hdr.k_ != k || hdr.dim_ != dim) {
+           ret = OB_ERR_UNEXPECTED;
+           SHARE_LOG(WARN, "output k/dim mismatch", K(ret), K(hdr.k_), K(k), K(hdr.dim_), K(dim));
+           kmeans_log(
+               "external_kmeans_fail reason=output_k_dim_mismatch out_k=%ld expect_k=%ld out_dim=%ld expect_dim=%ld",
+               hdr.k_,
+               k,
+               hdr.dim_,
+               dim);
+         } else if (OB_FAIL(centers_[next_idx()].init(dim, k, ivf_build_mem_ctx_))) {
+           SHARE_LOG(WARN, "init centers buffer failed", K(ret));
+           kmeans_log("external_kmeans_fail reason=init_centers_buffer ret=%d", ret);
+         } else {
+           for (int64_t i = 0; OB_SUCC(ret) && i < k; ++i) {
+             if (fread(row_buf.data(), sizeof(float) * static_cast<size_t>(dim), 1, fp) != 1) {
+               ret = OB_IO_ERROR;
+               SHARE_LOG(WARN, "fread centroid row failed", K(ret), K(i));
+               kmeans_log("external_kmeans_fail reason=fread_centroid_row i=%ld", i);
+             } else if (OB_FAIL(centers_[next_idx()].push_back(dim, row_buf.data()))) {
+               SHARE_LOG(WARN, "push_back center failed", K(ret), K(i));
+               kmeans_log("external_kmeans_fail reason=push_back_center i=%ld ret=%d", i, ret);
+             }
+           }
+         }
+         (void)fclose(fp);
+       }
+       (void)::unlink(out_template);
+     } else {
+       (void)::unlink(out_template);
+     }
+ 
+     if (OB_SUCC(ret)) {
+       for (int64_t i = 0; OB_SUCC(ret) && i < k; ++i) {
+         if (OB_FAIL(kmeans_ctx_->try_normalize(dim, centers_[next_idx()].at(i), centers_[next_idx()].at(i)))) {
+           LOG_WARN("failed to normalize external center", K(ret), K(i));
+         }
+       }
+     }
+     if (OB_SUCC(ret)) {
+       cur_idx_ = next_idx();
+       status_ = FINISH;
+       SHARE_LOG(INFO, "external gpu kmeans finished", K(k), K(dim), K(input_vectors.count()), K(max_iters));
+       const int64_t wall_ms =
+           (external_kmeans_wall_t0_ms > 0) ? (ObTimeUtility::current_time_ms() - external_kmeans_wall_t0_ms) : -1;
+       kmeans_log(
+           "external_kmeans_done k=%ld dim=%ld n=%ld max_iters=%d dist_algo=%d wall_elapsed_ms=%ld (out-of-process worker)",
+           k,
+           dim,
+           input_vectors.count(),
+           max_iters,
+           static_cast<int32_t>(kmeans_ctx_->dist_algo_),
+           wall_ms);
      }
    }
    return ret;
@@ -3302,7 +3762,7 @@
  int ObIvfFlatBuildHelper::init_kmeans_ctx(const int64_t dim)
  {
    int ret = OB_SUCCESS;
-   ObKmeansAlgoType algo_type = ObKmeansAlgoType::KAT_ELKAN;
+   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env();
    void *buf = nullptr;
    ObVectorNormalizeInfo *norm_info = nullptr;
    if (OB_NOT_NULL(executor_)) {
@@ -3452,7 +3912,7 @@
  int ObIvfPqBuildHelper::init_kmeans_ctx(const int64_t dim)
  {
    int ret = OB_SUCCESS;
-   ObKmeansAlgoType algo_type = ObKmeansAlgoType::KAT_ELKAN;
+   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env();
  
    void *buf = nullptr;
    int64_t pqnlist = 0;

@@ -95,6 +95,8 @@ enum ObVectorIndexAlgorithmType : uint16_t
 enum ObKmeansAlgoType
 {
   KAT_ELKAN = 0,
+  /** Run Lloyd k-means via an external process (e.g. Python + GPU). See OB_EXTERNAL_KMEANS_CMD. */
+  KAT_EXTERNAL_GPU = 1,
   KAT_MAX
 };
 

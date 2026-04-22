@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# Reference worker for ObExternalGpuKmeansAlgo (ob_vector_kmeans_ctx.cpp).
+# dist_algo MUST match oceanbase ObVectorIndexDistAlgorithm in ob_vector_index_util.h:
+#   VIDA_L2 = 0  -> Euclidean (squared L2) k-means, flash: batch_kmeans_Euclid
+#   VIDA_IP = 1  -> dot-product similarity k-means, flash: batch_kmeans_Dot
+#   VIDA_COS = 2 -> cosine similarity k-means, flash: batch_kmeans_Cosine (unit vectors)
+
+import os
+import struct
+import sys
+import time
+import traceback
+
+MAGIC = 0x4D4B424F
+
+# Profiling: monotonic ms. stderr often ends up only in observer logs (not in kmeans_*.log).
+# Same lines are appended to $HOME/log/ob_external_kmeans_worker.log (override: OB_EXTERNAL_KMEANS_WORKER_LOG).
+_PROF_T0 = 0.0
+_PROF_LAST = 0.0
+_PROF_FILE = None
+
+
+def _ensure_prof_file():
+    global _PROF_FILE
+    if _PROF_FILE is not None:
+        return
+    path = os.environ.get("OB_EXTERNAL_KMEANS_WORKER_LOG")
+    if not path:
+        home = os.environ.get("HOME")
+        if not home:
+            return
+        log_dir = os.path.join(home, "log")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError:
+            return
+        path = os.path.join(log_dir, "ob_external_kmeans_worker.log")
+    try:
+        _PROF_FILE = open(path, "a", buffering=1)
+        _PROF_FILE.write(
+            "\n======== ob_external_kmeans_worker pid=%d time=%s ========\n"
+            % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        _PROF_FILE.flush()
+    except OSError:
+        _PROF_FILE = None
+
+
+def _prof_reset():
+    global _PROF_T0, _PROF_LAST
+    _ensure_prof_file()
+    _PROF_T0 = time.perf_counter()
+    _PROF_LAST = _PROF_T0
+
+
+def _prof(msg):
+    global _PROF_LAST
+    now = time.perf_counter()
+    dt_prev = (now - _PROF_LAST) * 1000.0
+    dt_tot = (now - _PROF_T0) * 1000.0
+    line = "[ob_external_kmeans] %s | +%.1fms (prev) %.1fms (total)\n" % (msg, dt_prev, dt_tot)
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    if _PROF_FILE is not None:
+        try:
+            _PROF_FILE.write("[%d] %s" % (int(time.time() * 1000), line))
+            _PROF_FILE.flush()
+        except OSError:
+            pass
+    _PROF_LAST = now
+
+
+def _write_err_and_log(text):
+    """Same destination as _prof lines: stderr + ob_external_kmeans_worker.log (if available)."""
+    _ensure_prof_file()
+    if not text.endswith("\n"):
+        text = text + "\n"
+    sys.stderr.write(text)
+    sys.stderr.flush()
+    if _PROF_FILE is not None:
+        try:
+            _PROF_FILE.write("[%d] %s" % (int(time.time() * 1000), text))
+            _PROF_FILE.flush()
+        except OSError:
+            pass
+
+
+VERSION = 1
+FLAG_HAS_INIT = 1 << 0
+
+# ObVectorIndexDistAlgorithm (keep in sync with ob_vector_index_util.h)
+VIDA_L2 = 0
+VIDA_IP = 1
+VIDA_COS = 2
+
+
+def _read_exact(f, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = f.read(n - len(buf))
+        if not chunk:
+            raise EOFError("unexpected EOF")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _lloyd_numpy_l2(x, k, max_iters, init):
+    """Euclidean Lloyd; same objective as flash batch_kmeans_Euclid."""
+    import numpy as np
+
+    n, d = x.shape
+    if n < k:
+        raise ValueError("n_samples (%d) < k (%d)" % (n, k))
+    if init is not None:
+        centroids = init.astype(np.float32, copy=True)
+    else:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, size=k, replace=False)
+        centroids = x[idx].copy()
+    for _ in range(max_iters):
+        dists = ((x[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
+        labels = dists.argmin(axis=1)
+        new_c = np.zeros_like(centroids)
+        for j in range(k):
+            mask = labels == j
+            c = int(mask.sum())
+            if c > 0:
+                new_c[j] = x[mask].mean(axis=0)
+            else:
+                new_c[j] = centroids[j]
+        shift = float(np.linalg.norm(new_c - centroids, axis=1).max())
+        centroids = new_c
+        if shift < 1e-8:
+            break
+    return centroids
+
+
+def _lloyd_numpy_dot(x, k, max_iters, init):
+    """Maximize within-cluster dot similarity; aligns with flash batch_kmeans_Dot."""
+    import numpy as np
+
+    n, d = x.shape
+    if n < k:
+        raise ValueError("n_samples (%d) < k (%d)" % (n, k))
+    if init is not None:
+        centroids = init.astype(np.float32, copy=True)
+    else:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, size=k, replace=False)
+        centroids = x[idx].copy()
+    for _ in range(max_iters):
+        sims = np.dot(x, centroids.T)
+        labels = sims.argmax(axis=1)
+        new_c = np.zeros_like(centroids)
+        for j in range(k):
+            mask = labels == j
+            if int(mask.sum()) > 0:
+                new_c[j] = x[mask].mean(axis=0)
+            else:
+                new_c[j] = centroids[j]
+        shift = float(np.linalg.norm(new_c - centroids, axis=1).max())
+        centroids = new_c
+        if shift < 1e-8:
+            break
+    return centroids
+
+
+def _lloyd_numpy_cosine(x, k, max_iters, init):
+    """Spherical / cosine k-means on L2-normalized rows; aligns with flash batch_kmeans_Cosine."""
+    import numpy as np
+
+    eps = 1e-12
+    n, d = x.shape
+    if n < k:
+        raise ValueError("n_samples (%d) < k (%d)" % (n, k))
+    xn = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), eps)
+    if init is not None:
+        cn = init.astype(np.float32, copy=True)
+        cn = cn / np.maximum(np.linalg.norm(cn, axis=1, keepdims=True), eps)
+    else:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, size=k, replace=False)
+        cn = xn[idx].copy()
+    for _ in range(max_iters):
+        sims = np.dot(xn, cn.T)
+        labels = sims.argmax(axis=1)
+        new_cn = np.zeros_like(cn)
+        for j in range(k):
+            mask = labels == j
+            if int(mask.sum()) > 0:
+                mu = xn[mask].mean(axis=0)
+                nm = np.linalg.norm(mu)
+                new_cn[j] = mu / max(nm, eps)
+            else:
+                new_cn[j] = cn[j]
+        shift = float(np.linalg.norm(new_cn - cn, axis=1).max())
+        cn = new_cn
+        if shift < 1e-8:
+            break
+    return cn
+
+
+def _numpy_kmeans(x, k, max_iters, init, dist_algo):
+    if dist_algo == VIDA_L2:
+        return _lloyd_numpy_l2(x, k, max_iters, init)
+    if dist_algo == VIDA_IP:
+        return _lloyd_numpy_dot(x, k, max_iters, init)
+    if dist_algo == VIDA_COS:
+        return _lloyd_numpy_cosine(x, k, max_iters, init)
+    raise ValueError("unsupported dist_algo=%r (expected 0=L2, 1=IP, 2=COS)" % (dist_algo,))
+
+
+def _ceil_pow2(n):
+    """Smallest power of 2 >= n (n >= 1). Triton tl.arange(0, D) in flash-kmeans needs Po2 D."""
+    if n <= 1:
+        return 1
+    return 1 << ((n - 1).bit_length())
+
+
+def _try_flash_kmeans(x, k, max_iters, init, dist_algo):
+    import numpy as np
+
+    _, d_orig = x.shape
+    d_pad = _ceil_pow2(d_orig)
+    if d_pad > d_orig:
+        _prof("flash: pad dim %d -> %d (Triton requires power-of-2 D)" % (d_orig, d_pad))
+        x = np.pad(x, ((0, 0), (0, d_pad - d_orig)), mode="constant", constant_values=0)
+        if init is not None:
+            init = np.pad(init, ((0, 0), (0, d_pad - d_orig)), mode="constant", constant_values=0)
+
+    _prof("flash: import torch + flash_kmeans (cold start may be slow)")
+    import torch
+    from flash_kmeans import batch_kmeans_Cosine, batch_kmeans_Dot, batch_kmeans_Euclid
+
+    _prof("flash: imports done")
+    cuda_ok = torch.cuda.is_available()
+    dev = torch.device("cuda" if cuda_ok else "cpu")
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    _prof(
+        "flash: CUDA_VISIBLE_DEVICES=%r device=%s cuda_available=%s"
+        % (cv if cv else "(unset)", dev, cuda_ok)
+    )
+    if cuda_ok:
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(dev)
+            name = torch.cuda.get_device_name(dev)
+            _prof(
+                "flash: gpu mem free=%.2fGiB total=%.2fGiB name=%s"
+                % (free_b / (1024.0**3), total_b / (1024.0**3), name)
+            )
+        except Exception as e:
+            _prof("flash: gpu mem probe failed: %s" % (e,))
+        try:
+            torch.cuda.synchronize(dev)
+        except Exception:
+            pass
+    x_t = torch.as_tensor(x, dtype=torch.float16, device=dev).unsqueeze(0)
+    ic = None
+    if init is not None:
+        ic = torch.as_tensor(init, dtype=torch.float16, device=dev).unsqueeze(0)
+    _prof("flash: tensors on device (H2D done if CUDA)")
+    if dist_algo == VIDA_L2:
+        fn = batch_kmeans_Euclid
+    elif dist_algo == VIDA_IP:
+        fn = batch_kmeans_Dot
+    elif dist_algo == VIDA_COS:
+        fn = batch_kmeans_Cosine
+    else:
+        raise ValueError("unsupported dist_algo=%r" % (dist_algo,))
+    _prof("flash: batch_kmeans start k=%d max_iters=%d" % (k, max_iters))
+    _, centroids, _ = fn(
+        x_t, k, max_iters=max_iters, tol=1e-8, init_centroids=ic, verbose=False
+    )
+    _prof("flash: batch_kmeans done")
+    out = centroids[0].float().detach().cpu().numpy()
+    if d_pad > d_orig:
+        out = np.ascontiguousarray(out[:, :d_orig])
+    _prof("flash: centroids D2H + numpy done (trimmed to dim=%d)" % d_orig)
+    return out
+
+
+def main():
+    import numpy as np
+
+    if len(sys.argv) != 3:
+        print("usage: ob_external_kmeans_worker.py <input.bin> <output.bin>", file=sys.stderr)
+        return 2
+    in_path, out_path = sys.argv[1], sys.argv[2]
+    _prof_reset()
+    _prof("worker start in=%s out=%s wall=%s" % (in_path, out_path, time.strftime("%Y-%m-%d %H:%M:%S")))
+
+    with open(in_path, "rb") as fin:
+        fmt = "<IIqqqiiI"
+        hdr_bytes = _read_exact(fin, struct.calcsize(fmt))
+        magic, ver, n_samples, dim, k, max_iters, dist_algo, flags = struct.unpack(fmt, hdr_bytes)
+        _prof("read header ok n=%d dim=%d k=%d max_iters=%d dist_algo=%d flags=%d" % (n_samples, dim, k, max_iters, dist_algo, flags))
+        if magic != MAGIC or ver != VERSION:
+            print("bad input magic/version", magic, ver, file=sys.stderr)
+            return 1
+        if dist_algo not in (VIDA_L2, VIDA_IP, VIDA_COS):
+            print("unsupported dist_algo=%d (need 0=L2, 1=IP, 2=COS)" % dist_algo, file=sys.stderr)
+            return 1
+        sample_bytes = int(n_samples * dim * 4)
+        raw = _read_exact(fin, sample_bytes)
+        _prof("read sample bytes=%d" % sample_bytes)
+        x = np.frombuffer(raw, dtype=np.float32).reshape(int(n_samples), int(dim))
+        _prof("numpy reshape x (%d,%d)" % (int(n_samples), int(dim)))
+        init = None
+        if flags & FLAG_HAS_INIT:
+            raw_i = _read_exact(fin, int(k * dim * 4))
+            init = np.frombuffer(raw_i, dtype=np.float32).reshape(int(k), int(dim))
+            _prof("read init centers (%d,%d)" % (int(k), int(dim)))
+
+    _prof("input file closed")
+    use_flash = os.environ.get("USE_FLASH_KMEANS", "").strip().lower() in ("1", "true", "yes")
+    k, max_iters = int(k), int(max_iters)
+    _prof("USE_FLASH_KMEANS=%r -> use_flash=%s" % (os.environ.get("USE_FLASH_KMEANS", ""), use_flash))
+    if use_flash:
+        try:
+            centroids = _try_flash_kmeans(x, k, max_iters, init, dist_algo)
+        except Exception as e:
+            tb = traceback.format_exc()
+            _write_err_and_log("flash-kmeans failed, fallback numpy: %r\n%s" % (e, tb))
+            _prof("numpy fallback after flash error")
+            centroids = _numpy_kmeans(x, k, max_iters, init, dist_algo)
+            _prof("numpy kmeans done")
+    else:
+        _prof("numpy kmeans start (no flash)")
+        centroids = _numpy_kmeans(x, k, max_iters, init, dist_algo)
+        _prof("numpy kmeans done")
+
+    with open(out_path, "wb") as fout:
+        fout.write(struct.pack("<IIqq", MAGIC, VERSION, k, int(dim)))
+        fout.write(np.asarray(centroids, dtype=np.float32).tobytes())
+    _prof("write output ok path=%s" % out_path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        _write_err_and_log("ob_external_kmeans_worker failed: %r\n%s" % (exc, traceback.format_exc()))
+        sys.exit(1)

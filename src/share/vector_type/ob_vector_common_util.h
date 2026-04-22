@@ -185,6 +185,10 @@ struct ObCentersBuffer
   {
     return vectors_ + idx * dim_;
   }
+  const T* at(const int64_t idx) const
+  {
+    return vectors_ + idx * dim_;
+  }
   int push_back(const int64_t dim, T *vector);
   int add(const int64_t idx, const int64_t dim, T *vector);
   int divide(const int64_t idx, const int64_t count);

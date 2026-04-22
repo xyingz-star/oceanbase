@@ -261,6 +261,23 @@ public:
   bool is_hgraph_available() const { return enable_hgraph_ && nullptr != hgraph_index_; }
 };
 
+/**
+ * Offload standard (full-batch) k-means to an external command.
+ * Input/output binary format is documented in ob_vector_kmeans_ctx.cpp (ObExtKmeans*Header).
+ * Enable by setting env OB_EXTERNAL_KMEANS_CMD to a program that reads the input path and writes the output path.
+ */
+class ObExternalGpuKmeansAlgo : public ObKmeansAlgo
+{
+public:
+  explicit ObExternalGpuKmeansAlgo(ObIvfMemContext &ivf_build_mem_ctx) : ObKmeansAlgo(ivf_build_mem_ctx) {}
+  virtual ~ObExternalGpuKmeansAlgo() { destroy(); }
+  virtual void destroy() override { ObKmeansAlgo::destroy(); }
+
+protected:
+  virtual int init_first_center(const ObIArray<float *> &input_vectors) override;
+  virtual int do_kmeans(const ObIArray<float *> &input_vectors) override;
+};
+
 class ObKmeansExecutor
 {
 public:

@@ -44,9 +44,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _vdb_cli_mark="vectordb_bench/cli/cli.py"
 resolve_vectordbbench_root() {
   local d
+  # 注意：若 oceanbase 通过符号链接指到 /data/...，SCRIPT_DIR 会落在 /data/.../oceanbase/script，
+  # 此时 ../../VectorDBBench 指向 /data/.../test/VectorDBBench，可能与 $HOME/test/VectorDBBench 不同步。
   for d in "${VECTORDDBENCH_ROOT:-}" \
     "${SCRIPT_DIR}/../../VectorDBBench" \
+    "${HOME}/test/VectorDBBench" \
     "${HOME}/VectorDBBench" \
+    "/home/zhuxueying.zxy/test/VectorDBBench" \
     "/home/zhuxueying.zxy/VectorDBBench"; do
     [[ -z "${d}" ]] && continue
     if [[ -f "${d}/${_vdb_cli_mark}" ]]; then
