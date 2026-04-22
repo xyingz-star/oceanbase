@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>CPU vs GPU K-means — IVF sweep 对比</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --cpu: #5eead4;
+      --gpu: #f472b6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+      padding: 1.25rem 1.5rem 2rem;
+    }
+    h1 {
+      font-weight: 600; font-size: 1.35rem; margin: 0 0 0.35rem;
+      letter-spacing: -0.02em;
+    }
+    .sub { color: var(--muted); font-size: 0.88rem; margin-bottom: 1.25rem; max-width: 72ch; line-height: 1.45; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(220px, 1fr));
+      grid-template-rows: repeat(3, minmax(240px, 1fr));
+      gap: 1rem 1rem;
+      align-items: stretch;
+    }
+    @media (max-width: 1100px) {
+      .grid { grid-template-columns: 1fr; grid-template-rows: auto; }
+    }
+    .cell {
+      background: var(--card); border-radius: 12px; padding: 0.65rem 0.75rem 0.4rem;
+      border: 1px solid rgba(255,255,255,0.06);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+    }
+    .cell h2 {
+      margin: 0 0 0.5rem; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--muted);
+    }
+    .cell .metric { font-size: 0.95rem; font-weight: 600; color: var(--text); margin-bottom: 0.35rem; }
+    .canvas-wrap { position: relative; height: 220px; width: 100%; }
+    .legend-note { font-size: 0.75rem; color: var(--muted); margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>CPU K-means vs GPU 外切 K-means</h1>
+  <p class="sub">仅对比 CPU/GPU JSON 中 <strong>stages 完全一致</strong> 且均为 <strong>rebuild-only</strong>（optimize+search）的成对结果；optimize_duration 口径一致。元数据：points=12 skipped=3 (stages must match; rebuild-only for fair optimize)</p>
+  <div class="grid" id="grid"></div>
+  <script>
+  const DATA = {"1536D50K": {"nlist": [112, 224, 448, 896], "opt_cpu": [5.6513, 7.6735, 12.8087, 14.8225], "opt_gpu": [12.2011, 16.8242, 16.5233, 25.2821], "rec_cpu": [0.9896, 0.9685, 0.9329, 0.8946], "rec_gpu": [0.9903, 0.9684, 0.9366, 0.8986], "qps_cpu": [1138.885, 2355.7533, 4454.4963, 6032.4324], "qps_gpu": [1066.8565, 2061.3408, 3690.7677, 6416.8407]}, "1536D500K": {"nlist": [354, 707, 1414, 2828], "opt_cpu": [67.6534, 96.6844, 159.2633, 252.2594], "opt_gpu": [186.9457, 440.1791, 567.0615, 740.6339], "rec_cpu": [0.9804, 0.9656, 0.945, 0.9179], "rec_gpu": [0.9815, 0.9659, 0.948, 0.9204], "qps_cpu": [307.8698, 551.0255, 1037.6584, 1912.3219], "qps_gpu": [276.2381, 576.1785, 994.4675, 2141.4214]}, "768D1M": {"nlist": [500, 1000, 2000, 4000], "opt_cpu": [83.75, 135.3811, 223.0872, 259.2987], "opt_gpu": [312.5787, 504.2632, 869.0758, 1612.8619], "rec_cpu": [0.9675, 0.9415, 0.9153, 0.8849], "rec_gpu": [0.9695, 0.9446, 0.9184, 0.8907], "qps_cpu": [339.0722, 621.0871, 1104.9207, 1922.2096], "qps_gpu": [343.3306, 613.2067, 1085.9699, 1834.5934]}};
+  const datasets = ["1536D50K", "1536D500K", "768D1M"];
+  const metrics = [
+    { key: 'optimize', title: '索引创建 / 优化时间', yLabel: '秒 (s)', cpu: 'opt_cpu', gpu: 'opt_gpu' },
+    { key: 'recall', title: 'Recall', yLabel: 'recall', cpu: 'rec_cpu', gpu: 'rec_gpu' },
+    { key: 'qps', title: 'QPS', yLabel: 'QPS', cpu: 'qps_cpu', gpu: 'qps_gpu' },
+  ];
+  const grid = document.getElementById('grid');
+  const commonOpts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { labels: { color: '#c5d0e0', font: { size: 11 } } },
+    },
+    scales: {
+      x: {
+        title: { display: true, text: 'nlist', color: '#8b9cb3', font: { size: 11 } },
+        ticks: { color: '#8b9cb3', maxRotation: 45 },
+        grid: { color: 'rgba(255,255,255,0.06)' },
+      },
+      y: {
+        ticks: { color: '#8b9cb3' },
+        grid: { color: 'rgba(255,255,255,0.06)' },
+      },
+    },
+  };
+
+  metrics.forEach((met, row) => {
+    datasets.forEach((ds) => {
+      const d = DATA[ds];
+      if (!d) return;
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.innerHTML = '<h2>' + ds + '</h2><div class="metric">' + met.title + '</div><div class="canvas-wrap"><canvas></canvas></div>';
+      grid.appendChild(cell);
+      const canvas = cell.querySelector('canvas');
+      const ctx = canvas.getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: d.nlist.map(String),
+          datasets: [
+            {
+              label: 'CPU (Elkan / 进程内)',
+              data: d[met.cpu],
+              borderColor: '#5eead4',
+              backgroundColor: 'rgba(94,234,212,0.15)',
+              tension: 0.2,
+              fill: false,
+              pointRadius: 4,
+            },
+            {
+              label: 'GPU (外切 worker)',
+              data: d[met.gpu],
+              borderColor: '#f472b6',
+              backgroundColor: 'rgba(244,114,182,0.12)',
+              tension: 0.2,
+              fill: false,
+              pointRadius: 4,
+            },
+          ],
+        },
+        options: {
+          ...commonOpts,
+          scales: {
+            ...commonOpts.scales,
+            y: {
+              ...commonOpts.scales.y,
+              title: { display: true, text: met.yLabel, color: '#8b9cb3', font: { size: 11 } },
+            },
+          },
+        },
+      });
+    });
+  });
+  </script>
+</body>
+</html>
