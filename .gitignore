@@ -1,0 +1,6 @@
+q_kmeanspp/libq_kmeanspp_cuda.so
+kmeans_pp_test
+*.egg-info/
+__pycache__/
+build/
+dist/
