@@ -190,7 +190,7 @@ except ImportError:
 
 
 def benchmark_kmeans(b, n, d, k, kmeans_func, max_iters=100, tol=0.0):
-    x = torch.randn(b, n, d, device='cuda', dtype=torch.float16)
+    x = torch.randn(b, n, d, device="cuda", dtype=torch.float16)
     # warmup
     for _ in range(10):
         kmeans_func(x, k, max_iters=max_iters, tol=tol)

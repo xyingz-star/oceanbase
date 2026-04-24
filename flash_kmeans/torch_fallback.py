@@ -134,7 +134,19 @@ def _euclid_iter_torch_naive(x, x_sq, centroids, chunk_size_N=32768, chunk_size_
     
     return centroids_new, shift, cluster_ids
 
-def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False, chunk_size_N=32768, chunk_size_K=1024):
+def batch_kmeans_Euclid_torch_native(
+    x,
+    n_clusters,
+    max_iters=100,
+    tol=0.0,
+    init_centroids=None,
+    verbose=False,
+    chunk_size_N=32768,
+    chunk_size_K=1024,
+    *,
+    use_heuristic=True,
+    **kwargs,
+):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
 
@@ -144,10 +156,13 @@ def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init
         max_iters: Max number of iterations.
         tol: Relative tolerance for center movement.
         verbose: Print loss for each iter.
+        use_heuristic: Ignored (API compatibility with Triton ``batch_kmeans_Euclid``).
     Returns:
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
+    _ = use_heuristic
+    _ = kwargs
     B, N, D = x.shape
 
     # Pre-compute squared L2 norm of all points (constant during iterations)

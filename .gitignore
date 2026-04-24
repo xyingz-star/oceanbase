@@ -25,3 +25,8 @@ dist/
 # MacOS & Linux
 .DS_Store
 .idea/
+
+.venv311/
+.venv/
+venv/
+*.jsonl

@@ -17,20 +17,20 @@ def _euclid_iter(x, x_sq, centroids, use_heuristic=True):
     return centroids_new, shift, cluster_ids
 
 # 2. Cosine
-def _cosine_iter(x_norm, centroids):
+def _cosine_iter(x_norm, centroids, use_heuristic=True):
     # cos_sim = torch.einsum('bnd,bkd->bnk', x_norm, centroids)
     # cluster_ids = cos_sim.argmax(dim=-1)
-    cluster_ids = cosine_assign_triton(x_norm, centroids)
+    cluster_ids = cosine_assign_triton(x_norm, centroids, use_heuristic=use_heuristic)
     centroids_new = triton_centroid_update_sorted_cosine(x_norm, cluster_ids, centroids)
     # centroids_new = centroids_new.clone()
     shift = (centroids_new - centroids).norm(dim=-1).max()
     return centroids_new, shift, cluster_ids
 
 # 3. Dot-product
-def _dot_iter(x, centroids):
+def _dot_iter(x, centroids, use_heuristic=True):
     # sim = torch.einsum('bnd,bkd->bnk', x, centroids)
     # cluster_ids = sim.argmax(dim=-1)
-    cluster_ids = cosine_assign_triton(x, centroids)
+    cluster_ids = cosine_assign_triton(x, centroids, use_heuristic=use_heuristic)
     centroids_new = triton_centroid_update_sorted_cosine(x, cluster_ids, centroids)
     # centroids_new = centroids_new.clone()
     shift = (centroids_new - centroids).norm(dim=-1).max()
@@ -110,9 +110,22 @@ def batch_kmeans_Euclid(
     return cluster_ids, centroids, it + 1
 
 
-def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+def batch_kmeans_Cosine(
+    x,
+    n_clusters,
+    max_iters=100,
+    tol=0.0,
+    init_centroids=None,
+    verbose=False,
+    *,
+    use_heuristic=True,
+):
     """
     Batched KMeans clustering in PyTorch using Cosine similarity.
+
+    Applies ``F.normalize`` on GPU for ``x`` and initial centroids (then each centroid
+    update still renormalizes inside Triton). Callers may pass already-normalized data;
+    duplicate normalize is cheap and keeps semantics consistent.
 
     Args:
         x: Tensor of shape (B, N, D), batch_size B, N points per batch, D dims.
@@ -120,13 +133,14 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
         max_iters: Max number of iterations.
         tol: Relative tolerance for center movement.
         verbose: Print loss for each iter.
+        use_heuristic: Use smem-safe heuristic for Triton assign (recommended on L20, etc.).
     Returns:
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
     B, N, D = x.shape
 
-    # Normalize input vectors for cosine similarity
+    # Normalize input vectors for cosine similarity (GPU)
     x_norm = F.normalize(x, p=2, dim=-1)  # (B, N, D)
 
     if init_centroids is None:
@@ -136,7 +150,7 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
             x_norm,
             dim=1,
             index=indices[..., None].expand(-1, -1, D)
-        ) # (B, n_clusters, D)
+        )  # (B, n_clusters, D)
     else:
         centroids = init_centroids
 
@@ -145,7 +159,9 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
 
     for it in range(max_iters):
         # ---- compiled single iteration ----
-        centroids_new, center_shift, cluster_ids = _cosine_iter_compiled(x_norm, centroids)
+        centroids_new, center_shift, cluster_ids = _cosine_iter_compiled(
+            x_norm, centroids, use_heuristic
+        )
 
         # 4. Check for convergence
         if verbose:
@@ -157,7 +173,16 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=0.0, init_centroids=No
     return cluster_ids, centroids, it + 1
 
 
-def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
+def batch_kmeans_Dot(
+    x,
+    n_clusters,
+    max_iters=100,
+    tol=0.0,
+    init_centroids=None,
+    verbose=False,
+    *,
+    use_heuristic=True,
+):
     """
     Batched KMeans clustering in PyTorch using raw dot-product as similarity.
 
@@ -179,7 +204,9 @@ def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None,
 
     for it in range(max_iters):
         # ---- compiled single iteration ----
-        centroids_new, center_shift, cluster_ids = _dot_iter_compiled(x, centroids)
+        centroids_new, center_shift, cluster_ids = _dot_iter_compiled(
+            x, centroids, use_heuristic
+        )
 
         # 4. Check for convergence
         if verbose:
@@ -206,7 +233,9 @@ if __name__ == "__main__":
     print(f"Euclidean - cluster_ids shape: {cluster_ids_euclid.shape}, centroids shape: {centroids_euclid.shape}")
 
     print("\n=== Testing Cosine Similarity K-Means ===")
-    cluster_ids_cosine, centroids_cosine, n_iters_cosine = batch_kmeans_Cosine(x, n_clusters, max_iters=max_iters, verbose=True)
+    cluster_ids_cosine, centroids_cosine, n_iters_cosine = batch_kmeans_Cosine(
+        x, n_clusters, max_iters=max_iters, verbose=True
+    )
     print(f"Cosine - cluster_ids shape: {cluster_ids_cosine.shape}, centroids shape: {centroids_cosine.shape}")
 
     print("\n=== Testing Dot-Product K-Means ===")
@@ -236,7 +265,9 @@ if __name__ == "__main__":
     cosine_end = torch.cuda.Event(enable_timing=True)
     cosine_start.record()
     for i in range(rounds):
-        cluster_ids_cosine, centroids_cosine, n_iters_cosine = batch_kmeans_Cosine(x, n_clusters, max_iters=max_iters, init_centroids=centroids_cosine, verbose=False)
+        cluster_ids_cosine, centroids_cosine, n_iters_cosine = batch_kmeans_Cosine(
+            x, n_clusters, max_iters=max_iters, init_centroids=centroids_cosine, verbose=False
+        )
     cosine_end.record(); torch.cuda.synchronize()
     cosine_time = cosine_start.elapsed_time(cosine_end) / rounds
     cosine_time_per_iter = cosine_time / n_iters_cosine
