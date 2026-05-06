@@ -658,6 +658,12 @@ protected:
     ObString &com_key);
   virtual void reuse_cid_ctx() override;
 protected:
+  // IVF_SQ8: CID column stores uint8, but cosine/L2/IP/L1/etc. score in latent float space reconstructed from sq_meta.
+  bool ivf_sq8_cid_u8_score_latent_float_heap_{false};
+  const float *ivf_sq8_meta_min_{nullptr};
+  const float *ivf_sq8_meta_step_{nullptr};
+  void reset_ivf_sq8_latent_float_heap_ctx();
+
   // cid is begin with 0, so near_cid_vec_dist_ count is nlist + 1
   common::ObArrayWrap<bool> near_cid_dist_;
   common::ObArray<ObCenterId> near_cid_;
@@ -810,7 +816,11 @@ protected:
     return ret;
   }
   virtual int inner_release() override;
-  int get_real_search_vec_u8(bool is_vectorized, ObString &real_search_vec_u8);
+  /** Optional out_sq_meta_* copy min/step row payloads for IVF_SQ8 latent-distance path. */
+  int get_real_search_vec_u8(bool is_vectorized,
+                             ObString &real_search_vec_u8,
+                             ObString *out_sq_meta_min = nullptr,
+                             ObString *out_sq_meta_step = nullptr);
   int process_ivf_scan_post(bool is_vectorized) override;
   int process_ivf_scan_pre(ObIAllocator &allocator, bool is_vectorized);
 

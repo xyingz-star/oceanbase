@@ -22,6 +22,9 @@
 #include "sql/das/iter/ob_das_vec_scan_utils.h"
 #include "lib/roaringbitmap/ob_rb_memory_mgr.h"
 #include "deps/oblib/src/lib/vector/ob_vector_util.h"
+#include <cmath>
+#include <cstdlib>
+#include <type_traits>
 
 namespace oceanbase
 {
@@ -33,6 +36,75 @@ using namespace sql;
 
 namespace sql
 {
+
+namespace {
+
+OB_INLINE bool ivf_sq8_dis_needs_latent_float_scoring(ObExprVectorDistance::ObVecDisType dis_type)
+{
+  return dis_type != ObExprVectorDistance::ObVecDisType::HAMMING
+      && dis_type != ObExprVectorDistance::ObVecDisType::MAX_TYPE;
+}
+
+// Default ON: IVF_SQ8 distance uses raw query floats (real_search_vec_) vs SQ8+meta reconstructed candidates.
+// Set OB_IVF_SQ8_QUERY_FLOAT_DISTANCE=0 on observer to use legacy path (quantize query to u8 then decode to q_lat).
+OB_INLINE bool ivf_sq8_env_use_query_float_for_distance()
+{
+  const char *const e = ::getenv("OB_IVF_SQ8_QUERY_FLOAT_DISTANCE");
+  if (e != nullptr && e[0] == '0' && e[1] == '\0') {
+    return false;
+  }
+  return true;
+}
+
+void ivf_sq8_legacy_bin_center_u8_decode(
+    const int64_t dim,
+    const float *meta_min,
+    const float *meta_step,
+    const uint8_t *codes,
+    float *decoded)
+{
+  const float epsilon = static_cast<float>(1e-10);
+  for (int64_t i = 0; i < dim; ++i) {
+    if (fabsf(meta_step[i]) < epsilon) {
+      decoded[i] = meta_min[i];
+    } else {
+      decoded[i] = meta_min[i] + meta_step[i] * (static_cast<float>(codes[i]) + static_cast<float>(0.5));
+    }
+  }
+}
+
+int ivf_sq8_alloc_latent_float_from_sq8_blob(
+    const int64_t dim,
+    const float *meta_min,
+    const float *meta_step,
+    ObIAllocator &alloc,
+    const ObString &blob,
+    float *&out_lat)
+{
+  int ret = OB_SUCCESS;
+  out_lat = nullptr;
+  const int64_t need_u8_bytes = dim * static_cast<int64_t>(sizeof(uint8_t));
+  if (OB_ISNULL(meta_min) || OB_ISNULL(meta_step) || OB_ISNULL(blob.ptr())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (blob.length() < need_u8_bytes) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(out_lat = reinterpret_cast<float *>(
+                             alloc.alloc(static_cast<uint32_t>(sizeof(float) * dim))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ivf_sq8_legacy_bin_center_u8_decode(dim, meta_min, meta_step, reinterpret_cast<const uint8_t *>(blob.ptr()), out_lat);
+  }
+  return ret;
+}
+
+}
+
+void ObDASIvfScanIter::reset_ivf_sq8_latent_float_heap_ctx()
+{
+  ivf_sq8_cid_u8_score_latent_float_heap_ = false;
+  ivf_sq8_meta_min_ = nullptr;
+  ivf_sq8_meta_step_ = nullptr;
+}
 
 int ObDASIvfBaseScanIter::do_table_scan()
 {
@@ -1622,6 +1694,7 @@ int ObDASIvfScanIter::inner_init(ObDASIterParam &param)
 
 int ObDASIvfScanIter::inner_reuse()
 {
+  reset_ivf_sq8_latent_float_heap_ctx();
   near_cid_.reuse();
   memset(near_cid_dist_.get_data(), 0, near_cid_dist_.count() * sizeof(bool));
   return ObDASIvfBaseScanIter::inner_reuse();
@@ -1861,6 +1934,9 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         ObRowkey main_rowkey;
         ObString vec = cid_datum[i].get_string();
         bool skip = false;
+        float *lat_sq8_candidate = nullptr;
+        const bool latent_sq8_heap = (sizeof(float) == sizeof(T)) && ivf_sq8_cid_u8_score_latent_float_heap_ &&
+            OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_);
         if (OB_FAIL(ObTextStringHelper::read_real_string_data(
                         mem_context_->get_arena_allocator(),
                         cid_datum[i],
@@ -1875,7 +1951,24 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         } else if (prefilter != nullptr && !prefilter->test(main_rowkey)) {
           // has been filter, do nothing
           skip = true;
-        } else if (std::is_same<T, float>::value && need_norm_) {
+        } else if (!skip && latent_sq8_heap &&
+                   OB_FAIL(ivf_sq8_alloc_latent_float_from_sq8_blob(
+                       dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_,
+                       mem_context_->get_arena_allocator(), vec, lat_sq8_candidate))) {
+          LOG_WARN("failed to IVF SQ8 latent-dequant cid blob", K(ret));
+        } else if (nullptr != lat_sq8_candidate && need_norm_) {
+          if (is_first_vec) {
+            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
+                    &cid_vec_need_norm))) {
+              LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
+            } else {
+              is_first_vec = false;
+            }
+          } else if (cid_vec_need_norm && OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                                             vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
+            LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
+          }
+        } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
           if (is_first_vec) {
             if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
@@ -1894,10 +1987,21 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         if (OB_FAIL(ret)) {
           LOG_WARN("failed to get rowkey", K(ret));
         } else if (skip) {
-        } else if (OB_NOT_NULL(vec.ptr()) && OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
-          LOG_WARN("failed to push center.", K(ret));
-        } else {
-          adaptive_ctx_.vec_dist_calc_cnt_ ++;
+        } else if (nullptr != lat_sq8_candidate) {
+          // get_rowkeys_to_heap is also instantiated for T=uint8; latent CID is float * only when T=float.
+          if constexpr (std::is_same_v<T, float>) {
+            if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, lat_sq8_candidate, dim_))) {
+              LOG_WARN("failed to push center (IVF_SQ8 latent-dequant)", K(ret));
+            } else {
+              adaptive_ctx_.vec_dist_calc_cnt_ ++;
+            }
+          }
+        } else if (OB_NOT_NULL(vec.ptr())) {
+          if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
+            LOG_WARN("failed to push center.", K(ret));
+          } else {
+            adaptive_ctx_.vec_dist_calc_cnt_ ++;
+          }
         }
       }
     }
@@ -1907,6 +2011,7 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
       ObRowkey main_rowkey;
       ObString vec;
       bool skip = false;
+      float *lat_sq8_candidate = nullptr;
       adaptive_ctx_.cid_vec_scan_rows_ ++;
       // cid_vec_scan_iter output: [IVF_CID_VEC_CID_COL IVF_CID_VEC_VECTOR_COL ROWKEY]
       if (OB_FAIL(cid_vec_scan_iter->get_next_row())) {
@@ -1920,30 +2025,61 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         skip = true;
       } else if (OB_ISNULL(vec.ptr())) {
         // ignoring null vector.
-      } else if (std::is_same<T, float>::value && need_norm_) {
-        // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
-        if (is_first_vec) {
-          if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
-                  vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr()),
-                  &cid_vec_need_norm))) {
-            LOG_WARN("failed to normalize vector.", K(ret));
-          } else {
-            is_first_vec = false;
+      } else {
+        const bool latent_sq8_heap = (sizeof(float) == sizeof(T)) && ivf_sq8_cid_u8_score_latent_float_heap_ &&
+            OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_);
+        if (!skip && latent_sq8_heap &&
+            OB_FAIL(ivf_sq8_alloc_latent_float_from_sq8_blob(
+                dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, mem_context_->get_arena_allocator(), vec,
+                lat_sq8_candidate))) {
+          LOG_WARN("failed IVF SQ8 latent-dequant cid blob (serial scan)", K(ret));
+        } else if (nullptr != lat_sq8_candidate && need_norm_) {
+          if (is_first_vec) {
+            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
+                    &cid_vec_need_norm))) {
+              LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
+            } else {
+              is_first_vec = false;
+            }
+          } else if (cid_vec_need_norm &&
+                     OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                         vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
+            LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
           }
-        } else if (cid_vec_need_norm && OB_FAIL(ObVectorNormalize::L2_normalize_vector(
-                                            vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()),
-                                            reinterpret_cast<float *>(vec.ptr())))) {
-          LOG_WARN("failed to normalize vector.", K(ret));
+        } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
+          // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
+          if (is_first_vec) {
+            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                    vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr()),
+                    &cid_vec_need_norm))) {
+              LOG_WARN("failed to normalize vector.", K(ret));
+            } else {
+              is_first_vec = false;
+            }
+          } else if (cid_vec_need_norm &&
+                     OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                         vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr())))) {
+            LOG_WARN("failed to normalize vector.", K(ret));
+          }
         }
       }
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to get rowkey", K(ret));
       } else if (skip) {
-      } else if (OB_NOT_NULL(vec.ptr()) &&
-                 OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
-        LOG_WARN("failed to push center.", K(ret));
-      } else {
-        adaptive_ctx_.vec_dist_calc_cnt_ ++;
+      } else if (nullptr != lat_sq8_candidate) {
+        if constexpr (std::is_same_v<T, float>) {
+          if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, lat_sq8_candidate, dim_))) {
+            LOG_WARN("failed to push center (IVF_SQ8 latent-dequant)", K(ret));
+          } else {
+            adaptive_ctx_.vec_dist_calc_cnt_ ++;
+          }
+        }
+      } else if (OB_NOT_NULL(vec.ptr())) {
+        if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
+          LOG_WARN("failed to push center.", K(ret));
+        } else {
+          adaptive_ctx_.vec_dist_calc_cnt_ ++;
+        }
       }
     }
 
@@ -4266,7 +4402,11 @@ int ObDASIvfSQ8ScanIter::inner_release()
   return ret;
 }
 
-int ObDASIvfSQ8ScanIter::get_real_search_vec_u8(bool is_vectorized, ObString &real_search_vec_u8)
+int ObDASIvfSQ8ScanIter::get_real_search_vec_u8(
+    bool is_vectorized,
+    ObString &real_search_vec_u8,
+    ObString *out_sq_meta_min,
+    ObString *out_sq_meta_step)
 {
   int ret = OB_SUCCESS;
   const ObDASScanCtDef *sq_meta_ctdef = vec_aux_ctdef_->get_vec_aux_tbl_ctdef(
@@ -4370,6 +4510,14 @@ int ObDASIvfSQ8ScanIter::get_real_search_vec_u8(bool is_vectorized, ObString &re
     if (OB_SUCC(ret)) {
       real_search_vec_u8.assign_ptr(reinterpret_cast<char *>(res_vec), dim_ * sizeof(uint8_t));
     }
+    if (OB_SUCC(ret)) {
+      if (OB_NOT_NULL(out_sq_meta_min)) {
+        *out_sq_meta_min = min_vec;
+      }
+      if (OB_NOT_NULL(out_sq_meta_step)) {
+        *out_sq_meta_step = step_vec;
+      }
+    }
   }
   return ret;
 }
@@ -4377,24 +4525,130 @@ int ObDASIvfSQ8ScanIter::get_real_search_vec_u8(bool is_vectorized, ObString &re
 int ObDASIvfSQ8ScanIter::process_ivf_scan_post(bool is_vectorized)
 {
   int ret = OB_SUCCESS;
-  ObString real_search_vec_u8;
-  if (OB_FAIL(get_real_search_vec_u8(is_vectorized, real_search_vec_u8))) {
+  reset_ivf_sq8_latent_float_heap_ctx();
+  ObString real_u8;
+  ObString min_sv;
+  ObString step_sv;
+  if (OB_FAIL(get_real_search_vec_u8(is_vectorized, real_u8, &min_sv, &step_sv))) {
     LOG_WARN("failed to get real search vec u8", K(ret));
-  } else if (OB_FAIL(do_ivf_scan_post<uint8_t>(is_vectorized, reinterpret_cast<uint8_t *>(real_search_vec_u8.ptr())))) {
-    LOG_WARN("failed to do post filter", K(ret), K(is_vectorized));
+  } else {
+    const int64_t meta_bytes = dim_ * static_cast<int64_t>(sizeof(float));
+    const bool meta_ok = OB_NOT_NULL(min_sv.ptr()) && OB_NOT_NULL(step_sv.ptr())
+        && min_sv.length() >= meta_bytes && step_sv.length() >= meta_bytes;
+    bool used_sq8_latent_heap = false;
+    if (ivf_sq8_dis_needs_latent_float_scoring(dis_type_) && meta_ok) {
+      float *min_cp = reinterpret_cast<float *>(mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes)));
+      float *step_cp = reinterpret_cast<float *>(mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes)));
+      if (OB_ISNULL(min_cp) || OB_ISNULL(step_cp)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("alloc IVF SQ8 latent-float buffer failed", K(ret), K(dim_));
+      } else {
+        MEMCPY(min_cp, min_sv.ptr(), static_cast<uint32_t>(meta_bytes));
+        MEMCPY(step_cp, step_sv.ptr(), static_cast<uint32_t>(meta_bytes));
+        ivf_sq8_meta_min_ = min_cp;
+        ivf_sq8_meta_step_ = step_cp;
+        float *q_for_scan = nullptr;
+        float *q_lat = nullptr;
+        if (ivf_sq8_env_use_query_float_for_distance()) {
+          q_for_scan = reinterpret_cast<float *>(real_search_vec_.ptr());
+          if (OB_ISNULL(q_for_scan)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("IVF_SQ8 OB_IVF_SQ8_QUERY_FLOAT_DISTANCE: real_search_vec_ is null", K(ret), K(dim_));
+          }
+        } else if (OB_ISNULL(q_lat = reinterpret_cast<float *>(
+                                 mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes))))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("alloc IVF SQ8 q_lat failed", K(ret), K(dim_));
+        } else {
+          ivf_sq8_legacy_bin_center_u8_decode(
+              dim_,
+              min_cp,
+              step_cp,
+              reinterpret_cast<const uint8_t *>(real_u8.ptr()),
+              q_lat);
+          q_for_scan = q_lat;
+        }
+        if (OB_SUCC(ret)) {
+          ivf_sq8_cid_u8_score_latent_float_heap_ = true;
+          if (OB_FAIL(do_ivf_scan_post<float>(is_vectorized, q_for_scan))) {
+            LOG_WARN("failed to do post filter (IVF_SQ8 latent-float)", K(ret), K(is_vectorized));
+          }
+          used_sq8_latent_heap = true;
+          reset_ivf_sq8_latent_float_heap_ctx();
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !used_sq8_latent_heap
+        && OB_FAIL(do_ivf_scan_post<uint8_t>(is_vectorized, reinterpret_cast<uint8_t *>(real_u8.ptr())))) {
+      LOG_WARN("failed to do post filter", K(ret), K(is_vectorized));
+    }
   }
+  reset_ivf_sq8_latent_float_heap_ctx();
   return ret;
 }
 
 int ObDASIvfSQ8ScanIter::process_ivf_scan_pre(ObIAllocator &allocator, bool is_vectorized)
 {
   int ret = OB_SUCCESS;
-  ObString real_search_vec_u8;
-  if (OB_FAIL(get_real_search_vec_u8(is_vectorized, real_search_vec_u8))) {
+  reset_ivf_sq8_latent_float_heap_ctx();
+  ObString real_u8;
+  ObString min_sv;
+  ObString step_sv;
+  if (OB_FAIL(get_real_search_vec_u8(is_vectorized, real_u8, &min_sv, &step_sv))) {
     LOG_WARN("failed to get real search vec u8", K(ret));
-  } else if (OB_FAIL(do_ivf_scan_pre<uint8_t>(allocator, is_vectorized, reinterpret_cast<uint8_t*>(real_search_vec_u8.ptr())))) {
-    LOG_WARN("failed to get rowkey pre filter", K(ret), K(is_vectorized));
+  } else {
+    const int64_t meta_bytes = dim_ * static_cast<int64_t>(sizeof(float));
+    const bool meta_ok = OB_NOT_NULL(min_sv.ptr()) && OB_NOT_NULL(step_sv.ptr())
+        && min_sv.length() >= meta_bytes && step_sv.length() >= meta_bytes;
+    bool used_sq8_latent_heap = false;
+    if (ivf_sq8_dis_needs_latent_float_scoring(dis_type_) && meta_ok) {
+      float *min_cp = reinterpret_cast<float *>(mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes)));
+      float *step_cp = reinterpret_cast<float *>(mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes)));
+      if (OB_ISNULL(min_cp) || OB_ISNULL(step_cp)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("alloc IVF SQ8 latent-float buffer failed (pre)", K(ret), K(dim_));
+      } else {
+        MEMCPY(min_cp, min_sv.ptr(), static_cast<uint32_t>(meta_bytes));
+        MEMCPY(step_cp, step_sv.ptr(), static_cast<uint32_t>(meta_bytes));
+        ivf_sq8_meta_min_ = min_cp;
+        ivf_sq8_meta_step_ = step_cp;
+        float *q_for_scan = nullptr;
+        float *q_lat = nullptr;
+        if (ivf_sq8_env_use_query_float_for_distance()) {
+          q_for_scan = reinterpret_cast<float *>(real_search_vec_.ptr());
+          if (OB_ISNULL(q_for_scan)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("IVF_SQ8 OB_IVF_SQ8_QUERY_FLOAT_DISTANCE (pre): real_search_vec_ is null", K(ret), K(dim_));
+          }
+        } else if (OB_ISNULL(q_lat = reinterpret_cast<float *>(
+                                 mem_context_->get_arena_allocator().alloc(static_cast<int32_t>(meta_bytes))))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("alloc IVF SQ8 q_lat failed (pre)", K(ret), K(dim_));
+        } else {
+          ivf_sq8_legacy_bin_center_u8_decode(
+              dim_,
+              min_cp,
+              step_cp,
+              reinterpret_cast<const uint8_t *>(real_u8.ptr()),
+              q_lat);
+          q_for_scan = q_lat;
+        }
+        if (OB_SUCC(ret)) {
+          ivf_sq8_cid_u8_score_latent_float_heap_ = true;
+          if (OB_FAIL(do_ivf_scan_pre<float>(allocator, is_vectorized, q_for_scan))) {
+            LOG_WARN("failed to get rowkey pre filter (IVF_SQ8 latent-float)", K(ret), K(is_vectorized));
+          }
+          used_sq8_latent_heap = true;
+          reset_ivf_sq8_latent_float_heap_ctx();
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !used_sq8_latent_heap
+        && OB_FAIL(do_ivf_scan_pre<uint8_t>(allocator, is_vectorized, reinterpret_cast<uint8_t *>(real_u8.ptr())))) {
+      LOG_WARN("failed to get rowkey pre filter", K(ret), K(is_vectorized));
+    }
   }
+  reset_ivf_sq8_latent_float_heap_ctx();
   return ret;
 }
 

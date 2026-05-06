@@ -3,6 +3,9 @@
 # IVF sweep（仅标准 / GPU 外部 K-means 路径）：与 vectordbbench_oceanbaseivf_sweep_vec_data_nlist.sh 相同地
 # 遍历 数据集 × nlist 倍数（SWEEP_NLIST_MULTS），但不做 NMBKM div（OB_NMBKM_MIN_N_SCALE）遍历。
 #
+# 默认仅扫 768D1M（SWEEP_DATASETS 默认为 768D1M）。要扫多数据集： export SWEEP_DATASETS="1536D50K 1536D500K 768D1M"
+# 或单次限定目录： ONLY_DIRS="1536D50K 768D1M" ./本脚本.sh
+#
 # 每轮 bench 前默认删除 SWEEP_NMBKM_DIV_FILE（默认 /tmp/ob_nmbkm_min_n_scale），避免历史 sweep 写入的
 # div 仍被 observer 读取，从而误走 NMBKM 相关逻辑；便于专注验证「全量 / 外部 GPU」K-means。
 # 关闭删除： SWEEP_CLEAR_NMBKM_DIV_FILE=0
@@ -48,9 +51,9 @@ SWEEP_SKIP_DIRS="${SWEEP_SKIP_DIRS:-768D10M}"
 export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-80}"
 SWEEP_AUTO_OB_STAGES="${SWEEP_AUTO_OB_STAGES:-1}"
 
-DATASET_ORDER_SMALL_FIRST=(
-  1536D50K 1536D500K 768D1M cohere openai 1536D5M 768D100K 768D10M
-)
+# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认只包含 768D1M。
+SWEEP_DATASETS="${SWEEP_DATASETS:-768D1M}"
+read -r -a DATASET_ORDER_SMALL_FIRST <<< "${SWEEP_DATASETS}"
 
 [[ -f "${INNER}" ]] || { echo "ERROR: missing ${INNER}" >&2; exit 1; }
 
