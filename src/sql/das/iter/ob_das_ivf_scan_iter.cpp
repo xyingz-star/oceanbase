@@ -73,24 +73,20 @@ void ivf_sq8_legacy_bin_center_u8_decode(
   }
 }
 
-int ivf_sq8_alloc_latent_float_from_sq8_blob(
+// Decode SQ8 blob to caller-provided float buffer (dim floats). Reuse one buffer per CID scan to avoid per-row arena bump.
+OB_INLINE int ivf_sq8_decode_latent_float_to_buf(
     const int64_t dim,
     const float *meta_min,
     const float *meta_step,
-    ObIAllocator &alloc,
     const ObString &blob,
-    float *&out_lat)
+    float *out_lat)
 {
   int ret = OB_SUCCESS;
-  out_lat = nullptr;
   const int64_t need_u8_bytes = dim * static_cast<int64_t>(sizeof(uint8_t));
-  if (OB_ISNULL(meta_min) || OB_ISNULL(meta_step) || OB_ISNULL(blob.ptr())) {
+  if (OB_ISNULL(meta_min) || OB_ISNULL(meta_step) || OB_ISNULL(out_lat) || OB_ISNULL(blob.ptr())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (blob.length() < need_u8_bytes) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(out_lat = reinterpret_cast<float *>(
-                             alloc.alloc(static_cast<uint32_t>(sizeof(float) * dim))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     ivf_sq8_legacy_bin_center_u8_decode(dim, meta_min, meta_step, reinterpret_cast<const uint8_t *>(blob.ptr()), out_lat);
   }
@@ -1913,6 +1909,19 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
                                           bool &is_first_vec, bool &cid_vec_need_norm, ObIvfPreFilter *prefilter)
 {
   int ret = OB_SUCCESS;
+  float *ivf_sq8_latent_reuse_buf = nullptr;
+  if constexpr (std::is_same_v<T, float>) {
+    if (ivf_sq8_cid_u8_score_latent_float_heap_ && OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_)) {
+      if (OB_ISNULL(ivf_sq8_latent_reuse_buf = reinterpret_cast<float *>(mem_context_->get_arena_allocator().alloc(
+                      static_cast<uint32_t>(sizeof(float) * static_cast<uint32_t>(dim_)))))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("alloc IVF SQ8 latent reuse buffer (one per CID scan) failed", K(ret), K(dim_));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
   const ObDASScanCtDef *cid_vec_ctdef = vec_aux_ctdef_->get_vec_aux_tbl_ctdef(
       vec_aux_ctdef_->get_ivf_cid_vec_tbl_idx(), ObTSCIRScanType::OB_VEC_IVF_CID_VEC_SCAN);
   ObDASScanRtDef *cid_vec_rtdef = vec_aux_rtdef_->get_vec_aux_tbl_rtdef(vec_aux_ctdef_->get_ivf_cid_vec_tbl_idx());
@@ -1951,22 +1960,15 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         } else if (prefilter != nullptr && !prefilter->test(main_rowkey)) {
           // has been filter, do nothing
           skip = true;
-        } else if (!skip && latent_sq8_heap &&
-                   OB_FAIL(ivf_sq8_alloc_latent_float_from_sq8_blob(
-                       dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_,
-                       mem_context_->get_arena_allocator(), vec, lat_sq8_candidate))) {
-          LOG_WARN("failed to IVF SQ8 latent-dequant cid blob", K(ret));
-        } else if (nullptr != lat_sq8_candidate && need_norm_) {
-          if (is_first_vec) {
-            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
-                    &cid_vec_need_norm))) {
-              LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
-            } else {
-              is_first_vec = false;
-            }
-          } else if (cid_vec_need_norm && OB_FAIL(ObVectorNormalize::L2_normalize_vector(
-                                             vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
-            LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
+        } else if (!skip && latent_sq8_heap) {
+          if (OB_ISNULL(ivf_sq8_latent_reuse_buf)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("IVF SQ8 latent reuse buffer not allocated", K(ret));
+          } else if (OB_FAIL(ivf_sq8_decode_latent_float_to_buf(
+                         dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, vec, ivf_sq8_latent_reuse_buf))) {
+            LOG_WARN("failed to IVF SQ8 latent-dequant cid blob", K(ret));
+          } else {
+            lat_sq8_candidate = ivf_sq8_latent_reuse_buf;
           }
         } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
@@ -1982,6 +1984,21 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
                                               vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()),
                                               reinterpret_cast<float *>(vec.ptr())))) {
             LOG_WARN("failed to normalize vector.", K(ret));
+          }
+        }
+        // Latent decode uses its own branch above; must normalize here so we do not skip L2 when decode succeeds
+        // (original code relied on else-if after OB_FAIL(alloc), which does not run when latent branch is taken on success).
+        if (OB_SUCC(ret) && !skip && nullptr != lat_sq8_candidate && need_norm_) {
+          if (is_first_vec) {
+            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
+                    &cid_vec_need_norm))) {
+              LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
+            } else {
+              is_first_vec = false;
+            }
+          } else if (cid_vec_need_norm && OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                                             vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
+            LOG_WARN("failed to normalize latent SQ8 cid vector.", K(ret));
           }
         }
         if (OB_FAIL(ret)) {
@@ -2028,23 +2045,15 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
       } else {
         const bool latent_sq8_heap = (sizeof(float) == sizeof(T)) && ivf_sq8_cid_u8_score_latent_float_heap_ &&
             OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_);
-        if (!skip && latent_sq8_heap &&
-            OB_FAIL(ivf_sq8_alloc_latent_float_from_sq8_blob(
-                dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, mem_context_->get_arena_allocator(), vec,
-                lat_sq8_candidate))) {
-          LOG_WARN("failed IVF SQ8 latent-dequant cid blob (serial scan)", K(ret));
-        } else if (nullptr != lat_sq8_candidate && need_norm_) {
-          if (is_first_vec) {
-            if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
-                    &cid_vec_need_norm))) {
-              LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
-            } else {
-              is_first_vec = false;
-            }
-          } else if (cid_vec_need_norm &&
-                     OB_FAIL(ObVectorNormalize::L2_normalize_vector(
-                         vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
-            LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
+        if (!skip && latent_sq8_heap) {
+          if (OB_ISNULL(ivf_sq8_latent_reuse_buf)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("IVF SQ8 latent reuse buffer not allocated (serial)", K(ret));
+          } else if (OB_FAIL(ivf_sq8_decode_latent_float_to_buf(
+                         dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, vec, ivf_sq8_latent_reuse_buf))) {
+            LOG_WARN("failed IVF SQ8 latent-dequant cid blob (serial scan)", K(ret));
+          } else {
+            lat_sq8_candidate = ivf_sq8_latent_reuse_buf;
           }
         } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
@@ -2061,6 +2070,20 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
                          vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr())))) {
             LOG_WARN("failed to normalize vector.", K(ret));
           }
+        }
+      }
+      if (OB_SUCC(ret) && !skip && nullptr != lat_sq8_candidate && need_norm_) {
+        if (is_first_vec) {
+          if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate,
+                  &cid_vec_need_norm))) {
+            LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
+          } else {
+            is_first_vec = false;
+          }
+        } else if (cid_vec_need_norm &&
+                   OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                       vec_aux_ctdef_->dim_, lat_sq8_candidate, lat_sq8_candidate))) {
+          LOG_WARN("failed to normalize latent SQ8 cid vector (serial)", K(ret));
         }
       }
       if (OB_FAIL(ret)) {
