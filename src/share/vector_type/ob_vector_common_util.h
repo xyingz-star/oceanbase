@@ -442,6 +442,15 @@ public:
     get_distance_threshold(dis_type, similarity_threshold, distance_threshold_);
   }
 
+  OB_INLINE const VEC_T *query_vector() const
+  {
+    return const_vec_;
+  }
+  OB_INLINE oceanbase::sql::ObExprVectorDistance::ObVecDisType vec_dis_type() const
+  {
+    return dis_type_;
+  }
+
   int push_center(const CENTER_T &center, VEC_T *center_vec, const int64_t dim, CenterSaveMode center_save_mode = NOT_SAVE_CENTER_VEC);
   int push_center(const CENTER_T &center, double distance, CenterSaveMode center_save_mode = NOT_SAVE_CENTER_VEC, VEC_T *center_vec = nullptr);
   bool should_push_center(double distance) const;

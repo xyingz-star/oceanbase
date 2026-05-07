@@ -32,8 +32,8 @@ int ObVectorNormalize::L2_normalize_vector(const int64_t dim, float *data, float
     const float float_accuracy = 0.00001;
     float norm_l2_sqr = ObVectorL2Distance<float>::l2_norm_square(data, dim);
 
-    if (norm_l2_sqr > 0 && fabs(1.0f - norm_l2_sqr) > float_accuracy) {
-      float norm_l2 = sqrt(norm_l2_sqr);
+    if (norm_l2_sqr > 0) {
+      float norm_l2 = sqrtf(norm_l2_sqr);
       for (int64_t i = 0; i < dim; ++i) {
         norm_vector[i] = data[i] / norm_l2;
       }
@@ -41,6 +41,7 @@ int ObVectorNormalize::L2_normalize_vector(const int64_t dim, float *data, float
       MEMCPY(norm_vector, data, dim * sizeof(float));
     }
     if (OB_NOT_NULL(do_normalize)) {
+      // Whether stored vector was materially off unit sphere (IVF cid_vec skips extra normalizes on later rows when false)
       *do_normalize = norm_l2_sqr > 0 && fabs(1.0f - norm_l2_sqr) > float_accuracy;
     }
   }

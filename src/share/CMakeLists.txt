@@ -853,6 +853,7 @@ ob_set_subtarget(ob_share vector_type
   vector_type/ob_vector_div.cpp
   vector_type/ob_vector_l2_distance.cpp
   vector_type/ob_ivf_sq8_latent_decode.cpp
+  vector_type/ob_ivf_sq8_latent_fused_distance.cpp
   vector_type/ob_vector_ip_distance.cpp
   vector_type/ob_vector_cosine_distance.cpp
   vector_type/ob_vector_l1_distance.cpp

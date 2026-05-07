@@ -23,6 +23,7 @@
 #include "lib/roaringbitmap/ob_rb_memory_mgr.h"
 #include "deps/oblib/src/lib/vector/ob_vector_util.h"
 #include "share/vector_type/ob_ivf_sq8_latent_decode.h"
+#include "share/vector_type/ob_ivf_sq8_latent_fused_distance.h"
 #include <cmath>
 #include <cstdlib>
 #include <type_traits>
@@ -57,6 +58,55 @@ OB_INLINE bool ivf_sq8_env_use_query_float_for_distance()
   return true;
 }
 
+// Default ON: latent SQ8 center distance uses fused dequant+distance when eligible (no decoded float[dim] staging).
+// Set OB_IVF_SQ8_FUSED_DISTANCE=0 on observer to always SIMD-decode to the per-CID reuse buffer first.
+OB_INLINE bool ivf_sq8_env_use_fused_latent_distance()
+{
+  const char *const e = ::getenv("OB_IVF_SQ8_FUSED_DISTANCE");
+  if (e != nullptr && e[0] == '0' && e[1] == '\0') {
+    return false;
+  }
+  return true;
+}
+
+OB_INLINE bool ivf_sq8_latent_fusable_heap_metric(const ObExprVectorDistance::ObVecDisType dt)
+{
+  switch (dt) {
+    case ObExprVectorDistance::ObVecDisType::COSINE:
+    case ObExprVectorDistance::ObVecDisType::DOT:
+    case ObExprVectorDistance::ObVecDisType::EUCLIDEAN:
+    case ObExprVectorDistance::ObVecDisType::MANHATTAN:
+    case ObExprVectorDistance::ObVecDisType::EUCLIDEAN_SQUARED:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Fused cosine/dot(+need_norm) folds candidate L2 norm into the metric; other metrics + need_norm use decode path.
+// After COSINE query init, heap metric is DOT — allow DOT together with need_norm_ here.
+OB_INLINE bool ivf_sq8_try_fused_latent_distance(const bool need_norm, const ObExprVectorDistance::ObVecDisType dt)
+{
+  if (!ivf_sq8_env_use_fused_latent_distance()) {
+    return false;
+  }
+  if (!ivf_sq8_latent_fusable_heap_metric(dt)) {
+    return false;
+  }
+  if (need_norm && dt != ObExprVectorDistance::ObVecDisType::COSINE
+      && dt != ObExprVectorDistance::ObVecDisType::DOT) {
+    return false;
+  }
+  return true;
+}
+
+/// Latent IVF_SQ8 cid_vector holds SQ8 codes; raw `vec.ptr()` is only valid as float* outside latent / after fused or decode.
+OB_INLINE bool ivf_sq8_latent_row_may_push_raw_vec(
+    const bool latent_sq8_active, const bool fused_or_decode_handled, const float *decoded_candidate)
+{
+  return !latent_sq8_active || fused_or_decode_handled || decoded_candidate != nullptr;
+}
+
 // Decode SQ8 blob to caller-provided float buffer (dim floats). Reuse one buffer per CID scan to avoid per-row arena bump.
 OB_INLINE int ivf_sq8_decode_latent_float_to_buf(
     const int64_t dim,
@@ -76,6 +126,59 @@ OB_INLINE int ivf_sq8_decode_latent_float_to_buf(
         dim, meta_min, meta_step, reinterpret_cast<const uint8_t *>(blob.ptr()), out_lat);
   }
   return ret;
+}
+
+/// IVF_SQ8 latent-float: fused distance if eligible, otherwise decode into `reuse_buf`. Caller sets `ret` on hard errors only.
+OB_INLINE void ivf_sq8_latent_float_fused_then_decode(
+    ObVectorCenterClusterHelper<float, ObRowkey> &heap,
+    const ObRowkey &main_rowkey,
+    const ObString &vec,
+    const int64_t dim,
+    const bool need_norm,
+    const float *meta_min,
+    const float *meta_step,
+    float *reuse_buf,
+    bool &sq8_latent_handled,
+    float *&lat_sq8_candidate,
+    int64_t &vec_dist_calc_cnt,
+    int &ret)
+{
+  if (!OB_SUCC(ret)) {
+    return;
+  }
+  const int64_t need_u8_bytes = dim * static_cast<int64_t>(sizeof(uint8_t));
+  if (ivf_sq8_try_fused_latent_distance(need_norm, heap.vec_dis_type()) && vec.length() >= need_u8_bytes) {
+    double dist = 0.0;
+    const int fr = oceanbase::common::ivf_sq8_latent_fused_distance_vs_query(
+        heap.query_vector(),
+        dim,
+        meta_min,
+        meta_step,
+        reinterpret_cast<const uint8_t *>(vec.ptr()),
+        static_cast<int>(heap.vec_dis_type()),
+        need_norm,
+        dist);
+    if (OB_SUCC(fr)) {
+      if (OB_FAIL(heap.push_center(main_rowkey, dist, CenterSaveMode::NOT_SAVE_CENTER_VEC, nullptr))) {
+        LOG_WARN("failed to push center (IVF_SQ8 latent fused)", K(ret));
+      } else {
+        ++vec_dist_calc_cnt;
+        sq8_latent_handled = true;
+      }
+    } else if (fr != OB_ERR_NULL_VALUE) {
+      ret = fr;
+    }
+  }
+  if (OB_SUCC(ret) && !sq8_latent_handled) {
+    if (OB_ISNULL(reuse_buf)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("IVF SQ8 latent reuse buffer not allocated", K(ret));
+    } else if (OB_FAIL(ivf_sq8_decode_latent_float_to_buf(dim, meta_min, meta_step, vec, reuse_buf))) {
+      LOG_WARN("failed to IVF SQ8 latent-dequant cid blob", K(ret));
+    } else {
+      lat_sq8_candidate = reuse_buf;
+    }
+  }
 }
 
 }
@@ -1928,8 +2031,9 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         ObRowkey main_rowkey;
         ObString vec = cid_datum[i].get_string();
         bool skip = false;
+        bool sq8_latent_handled = false;
         float *lat_sq8_candidate = nullptr;
-        const bool latent_sq8_heap = (sizeof(float) == sizeof(T)) && ivf_sq8_cid_u8_score_latent_float_heap_ &&
+        const bool latent_sq8_heap = std::is_same_v<T, float> && ivf_sq8_cid_u8_score_latent_float_heap_ &&
             OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_);
         if (OB_FAIL(ObTextStringHelper::read_real_string_data(
                         mem_context_->get_arena_allocator(),
@@ -1946,14 +2050,20 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
           // has been filter, do nothing
           skip = true;
         } else if (!skip && latent_sq8_heap) {
-          if (OB_ISNULL(ivf_sq8_latent_reuse_buf)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("IVF SQ8 latent reuse buffer not allocated", K(ret));
-          } else if (OB_FAIL(ivf_sq8_decode_latent_float_to_buf(
-                         dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, vec, ivf_sq8_latent_reuse_buf))) {
-            LOG_WARN("failed to IVF SQ8 latent-dequant cid blob", K(ret));
-          } else {
-            lat_sq8_candidate = ivf_sq8_latent_reuse_buf;
+          if constexpr (std::is_same_v<T, float>) {
+            ivf_sq8_latent_float_fused_then_decode(
+                nearest_rowkey_heap,
+                main_rowkey,
+                vec,
+                dim_,
+                need_norm_,
+                ivf_sq8_meta_min_,
+                ivf_sq8_meta_step_,
+                ivf_sq8_latent_reuse_buf,
+                sq8_latent_handled,
+                lat_sq8_candidate,
+                adaptive_ctx_.vec_dist_calc_cnt_,
+                ret);
           }
         } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
@@ -1989,6 +2099,8 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
         if (OB_FAIL(ret)) {
           LOG_WARN("failed to get rowkey", K(ret));
         } else if (skip) {
+        } else if (sq8_latent_handled) {
+          // distance push done in fused IVF_SQ8 latent path
         } else if (nullptr != lat_sq8_candidate) {
           // get_rowkeys_to_heap is also instantiated for T=uint8; latent CID is float * only when T=float.
           if constexpr (std::is_same_v<T, float>) {
@@ -1998,7 +2110,8 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
               adaptive_ctx_.vec_dist_calc_cnt_ ++;
             }
           }
-        } else if (OB_NOT_NULL(vec.ptr())) {
+        } else if (OB_NOT_NULL(vec.ptr())
+                   && ivf_sq8_latent_row_may_push_raw_vec(latent_sq8_heap, sq8_latent_handled, lat_sq8_candidate)) {
           if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
             LOG_WARN("failed to push center.", K(ret));
           } else {
@@ -2013,6 +2126,8 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
       ObRowkey main_rowkey;
       ObString vec;
       bool skip = false;
+      bool sq8_latent_handled = false;
+      bool latent_sq8_heap = false;
       float *lat_sq8_candidate = nullptr;
       adaptive_ctx_.cid_vec_scan_rows_ ++;
       // cid_vec_scan_iter output: [IVF_CID_VEC_CID_COL IVF_CID_VEC_VECTOR_COL ROWKEY]
@@ -2028,17 +2143,23 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
       } else if (OB_ISNULL(vec.ptr())) {
         // ignoring null vector.
       } else {
-        const bool latent_sq8_heap = (sizeof(float) == sizeof(T)) && ivf_sq8_cid_u8_score_latent_float_heap_ &&
+        latent_sq8_heap = std::is_same_v<T, float> && ivf_sq8_cid_u8_score_latent_float_heap_ &&
             OB_NOT_NULL(ivf_sq8_meta_min_) && OB_NOT_NULL(ivf_sq8_meta_step_);
         if (!skip && latent_sq8_heap) {
-          if (OB_ISNULL(ivf_sq8_latent_reuse_buf)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("IVF SQ8 latent reuse buffer not allocated (serial)", K(ret));
-          } else if (OB_FAIL(ivf_sq8_decode_latent_float_to_buf(
-                         dim_, ivf_sq8_meta_min_, ivf_sq8_meta_step_, vec, ivf_sq8_latent_reuse_buf))) {
-            LOG_WARN("failed IVF SQ8 latent-dequant cid blob (serial scan)", K(ret));
-          } else {
-            lat_sq8_candidate = ivf_sq8_latent_reuse_buf;
+          if constexpr (std::is_same_v<T, float>) {
+            ivf_sq8_latent_float_fused_then_decode(
+                nearest_rowkey_heap,
+                main_rowkey,
+                vec,
+                dim_,
+                need_norm_,
+                ivf_sq8_meta_min_,
+                ivf_sq8_meta_step_,
+                ivf_sq8_latent_reuse_buf,
+                sq8_latent_handled,
+                lat_sq8_candidate,
+                adaptive_ctx_.vec_dist_calc_cnt_,
+                ret);
           }
         } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
@@ -2074,6 +2195,8 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to get rowkey", K(ret));
       } else if (skip) {
+      } else if (sq8_latent_handled) {
+        // distance push done in fused IVF_SQ8 latent path (serial)
       } else if (nullptr != lat_sq8_candidate) {
         if constexpr (std::is_same_v<T, float>) {
           if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, lat_sq8_candidate, dim_))) {
@@ -2082,7 +2205,8 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
             adaptive_ctx_.vec_dist_calc_cnt_ ++;
           }
         }
-      } else if (OB_NOT_NULL(vec.ptr())) {
+      } else if (OB_NOT_NULL(vec.ptr())
+                 && ivf_sq8_latent_row_may_push_raw_vec(latent_sq8_heap, sq8_latent_handled, lat_sq8_candidate)) {
         if (OB_FAIL(nearest_rowkey_heap.push_center(main_rowkey, reinterpret_cast<T *>(vec.ptr()), dim_))) {
           LOG_WARN("failed to push center.", K(ret));
         } else {
