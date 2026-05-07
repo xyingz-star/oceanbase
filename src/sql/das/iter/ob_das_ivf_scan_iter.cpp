@@ -22,6 +22,7 @@
 #include "sql/das/iter/ob_das_vec_scan_utils.h"
 #include "lib/roaringbitmap/ob_rb_memory_mgr.h"
 #include "deps/oblib/src/lib/vector/ob_vector_util.h"
+#include "share/vector_type/ob_ivf_sq8_latent_decode.h"
 #include <cmath>
 #include <cstdlib>
 #include <type_traits>
@@ -56,23 +57,6 @@ OB_INLINE bool ivf_sq8_env_use_query_float_for_distance()
   return true;
 }
 
-void ivf_sq8_legacy_bin_center_u8_decode(
-    const int64_t dim,
-    const float *meta_min,
-    const float *meta_step,
-    const uint8_t *codes,
-    float *decoded)
-{
-  const float epsilon = static_cast<float>(1e-10);
-  for (int64_t i = 0; i < dim; ++i) {
-    if (fabsf(meta_step[i]) < epsilon) {
-      decoded[i] = meta_min[i];
-    } else {
-      decoded[i] = meta_min[i] + meta_step[i] * (static_cast<float>(codes[i]) + static_cast<float>(0.5));
-    }
-  }
-}
-
 // Decode SQ8 blob to caller-provided float buffer (dim floats). Reuse one buffer per CID scan to avoid per-row arena bump.
 OB_INLINE int ivf_sq8_decode_latent_float_to_buf(
     const int64_t dim,
@@ -88,7 +72,8 @@ OB_INLINE int ivf_sq8_decode_latent_float_to_buf(
   } else if (blob.length() < need_u8_bytes) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ivf_sq8_legacy_bin_center_u8_decode(dim, meta_min, meta_step, reinterpret_cast<const uint8_t *>(blob.ptr()), out_lat);
+    oceanbase::common::ivf_sq8_legacy_bin_center_u8_decode(
+        dim, meta_min, meta_step, reinterpret_cast<const uint8_t *>(blob.ptr()), out_lat);
   }
   return ret;
 }
@@ -4583,7 +4568,7 @@ int ObDASIvfSQ8ScanIter::process_ivf_scan_post(bool is_vectorized)
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("alloc IVF SQ8 q_lat failed", K(ret), K(dim_));
         } else {
-          ivf_sq8_legacy_bin_center_u8_decode(
+          oceanbase::common::ivf_sq8_legacy_bin_center_u8_decode(
               dim_,
               min_cp,
               step_cp,
@@ -4648,7 +4633,7 @@ int ObDASIvfSQ8ScanIter::process_ivf_scan_pre(ObIAllocator &allocator, bool is_v
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("alloc IVF SQ8 q_lat failed (pre)", K(ret), K(dim_));
         } else {
-          ivf_sq8_legacy_bin_center_u8_decode(
+          oceanbase::common::ivf_sq8_legacy_bin_center_u8_decode(
               dim_,
               min_cp,
               step_cp,
