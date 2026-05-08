@@ -58,15 +58,12 @@ OB_INLINE bool ivf_sq8_env_use_query_float_for_distance()
   return true;
 }
 
-// Default ON: latent SQ8 center distance uses fused dequant+distance when eligible (no decoded float[dim] staging).
-// Set OB_IVF_SQ8_FUSED_DISTANCE=0 on observer to always SIMD-decode to the per-CID reuse buffer first.
+// Default OFF: latent SQ8 decodes to the per-CID reuse buffer first (decode path), then scores.
+// Set OB_IVF_SQ8_FUSED_DISTANCE=1 on observer to use fused dequant+distance when eligible (no float[dim] staging).
 OB_INLINE bool ivf_sq8_env_use_fused_latent_distance()
 {
   const char *const e = ::getenv("OB_IVF_SQ8_FUSED_DISTANCE");
-  if (e != nullptr && e[0] == '0' && e[1] == '\0') {
-    return false;
-  }
-  return true;
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
 
 OB_INLINE bool ivf_sq8_latent_fusable_heap_metric(const ObExprVectorDistance::ObVecDisType dt)

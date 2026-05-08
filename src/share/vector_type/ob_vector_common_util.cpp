@@ -33,9 +33,15 @@ int ObVectorNormalize::L2_normalize_vector(const int64_t dim, float *data, float
     float norm_l2_sqr = ObVectorL2Distance<float>::l2_norm_square(data, dim);
 
     if (norm_l2_sqr > 0) {
-      float norm_l2 = sqrtf(norm_l2_sqr);
-      for (int64_t i = 0; i < dim; ++i) {
-        norm_vector[i] = data[i] / norm_l2;
+      const float norm_l2 = sqrtf(norm_l2_sqr);
+      if (data != norm_vector) {
+        MEMCPY(norm_vector, data, dim * sizeof(float));
+      }
+      if (OB_FAIL(common::ObVectorDiv::calc(norm_vector, norm_l2, dim))) {
+        ret = OB_SUCCESS;
+        for (int64_t i = 0; i < dim; ++i) {
+          norm_vector[i] = data[i] / norm_l2;
+        }
       }
     } else if (data != norm_vector) {
       MEMCPY(norm_vector, data, dim * sizeof(float));
