@@ -13,6 +13,7 @@
 # 或直接调用原 sweep 脚本。
 #
 # 其余环境变量、ONLY_DIRS、SWEEP_*、OB_*、VEC_DATA_ROOT 等与父脚本完全一致。
+# 父脚本默认仅扫数据集 1536D500K；多数据集 / 全盘发现见 vectordbbench_oceanbaseivf_sweep_vec_data_nlist.sh 头部说明。
 #
 
 set -euo pipefail

@@ -308,6 +308,94 @@ class ObIvfAadaptiveCtx
   bool is_brute_force_;
 };
 
+/// IVF scan latency breakdown (microseconds).
+/// Enable with OB_IVF_LATENCY_BREAKDOWN=1 on observer.
+/// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N=N (optional): only one observer worker thread (owner, pinned by
+/// first IVF scan after idle or startup) counts queries; while (indexed row estimate, dim, nlist) stay unchanged,
+/// emit every N-th IVF process_ivf_scan on that thread (N defaults to 10). The first such scan after a
+/// dataset-key change counts as query 1 and is emitted. Other threads skip breakdown (no timers / no log).
+/// If wall time since the previous IVF scan exceeds ~60s (benchmark idle), the owner pin resets so the next
+/// scan can claim ownership again.
+/// Additionally appends the same metrics (one line per sample) to per-thread files under
+/// ${HOME}/log/ob_ivf_latency_breakdown.n<rows>_d<dim>_c<nlist>.<tid>.log
+/// (Observer process unix user's HOME; rows/dim/nlist from planner stats / index params), or to
+/// OB_IVF_LATENCY_BREAKDOWN_LOG_FILE if set. Placeholders in that path: "%t" thread id, "%r" indexed
+/// row count (dataset size estimate), "%m" vector dimension, "%c" IVF centroid count (nlist),
+/// "%%" a literal "%". If the template contains no "%t", ".<tid>" is still inserted before ".log"
+/// (legacy behavior). Per worker thread, the resolved path is reused while (rows, dim, nlist) stay
+/// the same (append to one file); when any of the three changes, a new log path is resolved (new file).
+/// Custom templates without "%r/%m/%c" get ".n*_d*_c*" injected before ".log" so
+/// different datasets do not share one filename.
+struct ObIvfLatencyBreakdown {
+  void reset()
+  {
+    enabled_ = false;
+    ivf_total_us_ = 0;
+    finalize_us_ = 0;
+    das_body_us_ = 0;
+    coarse_wall_us_ = 0;
+    coarse_load_us_ = 0;
+    coarse_compute_us_ = 0;
+    fine_wall_us_ = 0;
+    fine_load_us_ = 0;
+    fine_compute_us_ = 0;
+    fine_cv_prepare_us_ = 0;
+    fine_cv_probe_str_us_ = 0;
+    fine_cv_scan_open_us_ = 0;
+    fine_cv_storage_fetch_us_ = 0;
+    fine_cv_storage_fetch_first_batch_us_ = 0;
+    fine_cv_storage_fetch_other_batches_us_ = 0;
+    fine_cv_storage_fetch_max_batch_us_ = 0;
+    fine_cv_storage_fetch_batch_cnt_ = 0;
+    fine_cv_batch_expr_us_ = 0;
+    fine_cv_iter_reuse_us_ = 0;
+    fine_heap_finalize_us_ = 0;
+    brute_wall_us_ = 0;
+    sq8_prep_us_ = 0;
+  }
+  bool enabled_{false};
+  int64_t ivf_total_us_{0};
+  int64_t finalize_us_{0};
+  /// Time inside do_ivf_scan (may run twice on adaptive retry).
+  int64_t das_body_us_{0};
+  /// Wall time of get_nearest_probe_center_ids (full call).
+  int64_t coarse_wall_us_{0};
+  /// Centroid table scan / heap build in generate_nearest_cid_heap (non-HGraph path).
+  int64_t coarse_load_us_{0};
+  /// Top-n probe selection after generate_nearest_cid_heap (non-HGraph path).
+  int64_t coarse_compute_us_{0};
+  /// Per-iteration wall in fine phase: get_nearest_limit_rowkeys_in_cids + get_next_center_ids in same loop.
+  int64_t fine_wall_us_{0};
+  /// Per-row split inside get_rowkeys_to_heap: load ≈ datum read / rowkey extraction; compute ≈ normalize / fused distance / heap push.
+  int64_t fine_load_us_{0};
+  int64_t fine_compute_us_{0};
+  /// Finer splits under fine_wall_us_ (mostly cid_vector retrieval path).
+  int64_t fine_cv_prepare_us_{0};
+  /// Per-probe overhead: cid buffer assign + center id to string before each get_rowkeys_to_heap().
+  int64_t fine_cv_probe_str_us_{0};
+  /// Per get_rowkeys_to_heap(): open scan range for cid_vector.
+  int64_t fine_cv_scan_open_us_{0};
+  /// Vectorized: sum of cid_vec_iter_->get_next_rows() per batch (storage / executor pull).
+  int64_t fine_cv_storage_fetch_us_{0};
+  /// Sum of wall time for the **first** get_next_rows per cid_vec scan (each get_rowkeys_to_heap).
+  int64_t fine_cv_storage_fetch_first_batch_us_{0};
+  /// Sum of wall time for 2nd, 3rd, ... get_next_rows calls within those scans.
+  int64_t fine_cv_storage_fetch_other_batches_us_{0};
+  /// Max single-batch get_next_rows latency (microseconds).
+  int64_t fine_cv_storage_fetch_max_batch_us_{0};
+  /// Total number of get_next_rows calls (all probes / batches).
+  int64_t fine_cv_storage_fetch_batch_cnt_{0};
+  /// Vectorized only: per non-empty batch — eval scaffolding (guard, set_batch_size, locate_batch_datums); excludes per-row loop.
+  int64_t fine_cv_batch_expr_us_{0};
+  /// cid_vec iterator reuse_iter() at end of vectorized batches; serial scan iter reuse().
+  int64_t fine_cv_iter_reuse_us_{0};
+  /// After cid scan: nearest_rowkey_heap.get_nearest_probe_center_ids() into saved rowkeys (saved_rowkeys overload only).
+  int64_t fine_heap_finalize_us_{0};
+  int64_t brute_wall_us_{0};
+  /// ObDASIvfSQ8ScanIter::process_ivf_scan_pre only: prep before do_ivf_scan_pre.
+  int64_t sq8_prep_us_{0};
+};
+
 class ObDASIvfBaseScanIter : public ObDASIter
 {
 public:
@@ -368,7 +456,8 @@ public:
         hgraph_vsag_alloc_(nullptr),
         hgraph_has_next_center_(true),
         has_used_hgraph_(false),
-        strategy_(ObVecIdxQueryStrategy::RECALL_FIRST)
+        strategy_(ObVecIdxQueryStrategy::RECALL_FIRST),
+        ivf_lat_()
   {
     dis_type_ = ObExprVectorDistance::ObVecDisType::MAX_TYPE;
     saved_rowkeys_.set_attr(ObMemAttr(MTL_ID(), "VecIdxKeyRanges"));
@@ -509,6 +598,8 @@ protected:
   bool has_next_center(); // check if there are more centers available
   virtual void reuse_cid_ctx();
   int64_t get_cid_vec_batch_count();
+  void ivf_lat_reset();
+  void ivf_lat_log(const bool is_vectorized) const;
 
 protected:
   static const int64_t CENTROID_PRI_KEY_CNT = 1;
@@ -602,6 +693,7 @@ protected:
   bool hgraph_has_next_center_;  // Whether HGraph has more centers available for iterative filtering
   bool has_used_hgraph_;  // Flag to track if HGraph was used in initial search
   ObVecIdxQueryStrategy strategy_;
+  ObIvfLatencyBreakdown ivf_lat_;
 };
 
 class ObDASIvfScanIter : public ObDASIvfBaseScanIter

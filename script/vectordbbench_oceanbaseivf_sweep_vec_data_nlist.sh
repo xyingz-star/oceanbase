@@ -9,7 +9,8 @@
 # 与 observer 同机且可读即可，无需改代码重编、无需重启 observer。
 # 1536D5M 在 resolve_case_type 中注释；768D10M 默认由 SWEEP_SKIP_DIRS 排除（不跑、不依赖 CaseType）。
 # 检索：串行阶段保留（recall/ndcg）；并发阶段仅一档 VDB_NUM_CONCURRENCY（默认 80）。不要串行可设 VDB_SKIP_SEARCH_SERIAL=1。
-# 常用：ONLY_DIRS="1536D500K"  SWEEP_DAEMONIZE=1  VEC_DATA_ROOT=...
+# 数据集：默认 **仅 1536D500K**。多数据集：ONLY_DIRS="1536D50K 1536D500K"；全盘发现：SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS）。
+# 常用：SWEEP_DAEMONIZE=1  VEC_DATA_ROOT=...
 #
 # ---------- 自动表 / 数据 / 索引策略（默认开，无需再 export VDB_SKIP_* / VDB_REBUILD_*）----------
 # 仅需：OB_USER OB_DATABASE OB_PORT（及 OB_HOST、OB_PASSWORD）。表名固定规则：vdb_<数据集目录小写>（如 vdb_1536d50k）。
@@ -260,8 +261,10 @@ mkdir -p "${DATASET_LOCAL_DIR}"
 if [[ -n "${ONLY_DIRS:-}" ]]; then
   # shellcheck disable=SC2206
   mapfile -t _raw < <(printf '%s\n' ${ONLY_DIRS})
-else
+elif [[ "${SWEEP_DISCOVER_ALL_DIRS:-0}" == "1" ]]; then
   mapfile -t _raw < <(find "${VEC_DATA_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+else
+  mapfile -t _raw < <(printf '%s\n' 1536D500K)
 fi
 mapfile -t _discovered < <(order_vec_data_dirs_small_first "${VEC_DATA_ROOT}" "${_raw[@]}")
 

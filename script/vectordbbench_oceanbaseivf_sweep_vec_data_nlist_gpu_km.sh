@@ -3,8 +3,8 @@
 # IVF sweep（仅标准 / GPU 外部 K-means 路径）：与 vectordbbench_oceanbaseivf_sweep_vec_data_nlist.sh 相同地
 # 遍历 数据集 × nlist 倍数（SWEEP_NLIST_MULTS），但不做 NMBKM div（OB_NMBKM_MIN_N_SCALE）遍历。
 #
-# 默认扫 1536D50K、1536D500K、768D1M（由小到大）。覆盖： export SWEEP_DATASETS="768D1M"
-# 或单次限定目录： ONLY_DIRS="1536D50K 768D1M" ./本脚本.sh
+# 默认 **仅 1536D500K**。多数据集： SWEEP_DATASETS="1536D50K 1536D500K 768D1M" 或 ONLY_DIRS="..."（与父脚本一致）。
+# 全盘发现（等同原 find）： SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS / 勿缩小 SWEEP_DATASETS）。
 #
 # 每轮 bench 前默认删除 SWEEP_NMBKM_DIV_FILE（默认 /tmp/ob_nmbkm_min_n_scale），避免历史 sweep 写入的
 # div 仍被 observer 读取，从而误走 NMBKM 相关逻辑；便于专注验证「全量 / 外部 GPU」K-means。
@@ -51,8 +51,8 @@ SWEEP_SKIP_DIRS="${SWEEP_SKIP_DIRS:-768D10M}"
 export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-80}"
 SWEEP_AUTO_OB_STAGES="${SWEEP_AUTO_OB_STAGES:-1}"
 
-# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认 1536D50K → 1536D500K → 768D1M（规模递增）。
-SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K 1536D500K 768D1M}"
+# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认仅 1536D500K。
+SWEEP_DATASETS="${SWEEP_DATASETS:-1536D500K}"
 read -r -a DATASET_ORDER_SMALL_FIRST <<< "${SWEEP_DATASETS}"
 
 [[ -f "${INNER}" ]] || { echo "ERROR: missing ${INNER}" >&2; exit 1; }
@@ -231,8 +231,10 @@ mkdir -p "${DATASET_LOCAL_DIR}"
 if [[ -n "${ONLY_DIRS:-}" ]]; then
   # shellcheck disable=SC2206
   mapfile -t _raw < <(printf '%s\n' ${ONLY_DIRS})
-else
+elif [[ "${SWEEP_DISCOVER_ALL_DIRS:-0}" == "1" ]]; then
   mapfile -t _raw < <(find "${VEC_DATA_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+else
+  mapfile -t _raw < <(printf '%s\n' "${DATASET_ORDER_SMALL_FIRST[@]}")
 fi
 mapfile -t _discovered < <(order_vec_data_dirs_small_first "${VEC_DATA_ROOT}" "${_raw[@]}")
 
