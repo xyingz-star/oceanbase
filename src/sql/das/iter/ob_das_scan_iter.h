@@ -106,6 +106,7 @@ protected:
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
   int try_check_vec_pre_filter_status(const int64_t row_count = 1);
   int check_vec_pre_filter_status();
+  void revert_storage_scan_iter_if_any();
 
 private:
   static const uint64_t CHECK_STATUS_ROWS = 500;

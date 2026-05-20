@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# IVF sweep（仅标准 / GPU 外部 K-means 路径）：与 vectordbbench_oceanbaseivf_sweep_vec_data_nlist.sh 相同地
-# 遍历 数据集 × nlist 倍数（SWEEP_NLIST_MULTS），但不做 NMBKM div（OB_NMBKM_MIN_N_SCALE）遍历。
-#
-# 默认 **仅 1536D500K**。多数据集： SWEEP_DATASETS="1536D50K 1536D500K 768D1M" 或 ONLY_DIRS="..."（与父脚本一致）。
-# 全盘发现（等同原 find）： SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS / 勿缩小 SWEEP_DATASETS）。
+# IVF sweep（仅标准 / GPU 外部 K-means 路径）：默认只跑 **一组** 参数（单数据集 × 单 nlist 倍数）。
+# 默认：**1536D50K** + **SWEEP_NLIST_MULTS=0.25**（nlist≈sqrt(N)×0.25，与 conc=80 压测一致）。
+# 多组扫参：export SWEEP_DATASETS="1536D50K 1536D500K" SWEEP_NLIST_MULTS="0.25 0.5 1 2 4"
+# ONLY_DIRS=... 可覆盖数据集子集。
+# 全盘发现： SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS / 勿缩小 SWEEP_DATASETS）。
+# 索引：默认 IVF_FLAT（INDEX_TYPE=ivf_flat）。
 #
 # 每轮 bench 前默认删除 SWEEP_NMBKM_DIV_FILE（默认 /tmp/ob_nmbkm_min_n_scale），避免历史 sweep 写入的
 # div 仍被 observer 读取，从而误走 NMBKM 相关逻辑；便于专注验证「全量 / 外部 GPU」K-means。
@@ -42,18 +43,27 @@ CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 SWEEP_LOG_ENABLE="${SWEEP_LOG_ENABLE:-1}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${HOME}/log/vdb_ivf_sweep_gpu_km}"
 SWEEP_LOG_TIMESTAMP="${SWEEP_LOG_TIMESTAMP:-1}"
-SWEEP_NLIST_MULTS="${SWEEP_NLIST_MULTS:-0.25 0.5 1 2 4}"
+SWEEP_NLIST_MULTS="${SWEEP_NLIST_MULTS:-0.25}"
 # 与 observer 读取路径一致；仅用于 rm，本脚本不再写入 div
 SWEEP_NMBKM_DIV_FILE="${SWEEP_NMBKM_DIV_FILE:-/tmp/ob_nmbkm_min_n_scale}"
 # 1=每轮 bench 前删除 div 文件，避免 NMBKM 配置残留
 SWEEP_CLEAR_NMBKM_DIV_FILE="${SWEEP_CLEAR_NMBKM_DIV_FILE:-1}"
 SWEEP_SKIP_DIRS="${SWEEP_SKIP_DIRS:-768D10M}"
-export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-80}"
+export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-8}"
 SWEEP_AUTO_OB_STAGES="${SWEEP_AUTO_OB_STAGES:-1}"
+# IVF cid cluster cache stats (observer reads env; default on in code, explicit here for sweep logs)
+export OB_IVF_CID_CLUSTER_CACHE_STATS="${OB_IVF_CID_CLUSTER_CACHE_STATS:-1}"
+export OB_IVF_CID_CLUSTER_CACHE_LOG_DIR="${OB_IVF_CID_CLUSTER_CACHE_LOG_DIR:-${HOME}/log}"
+# Per-cid progress on by default (matches observer). Set EVERY_N_CID=0 or STATS_LIVE=0 to reduce log I/O.
+export OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID="${OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID:-1}"
 
-# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认仅 1536D500K。
-SWEEP_DATASETS="${SWEEP_DATASETS:-1536D500K}"
-read -r -a DATASET_ORDER_SMALL_FIRST <<< "${SWEEP_DATASETS}"
+# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认仅一组 1536D50K。
+SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K}"
+export INDEX_TYPE="${INDEX_TYPE:-ivf_flat}"
+read -r -a _SWEEP_DATASET_ORDER <<< "${SWEEP_DATASETS}"
+DATASET_ORDER_SMALL_FIRST=(
+  1536D50K 1536D500K 768D1M cohere openai 1536D5M 768D100K 768D10M
+)
 
 [[ -f "${INNER}" ]] || { echo "ERROR: missing ${INNER}" >&2; exit 1; }
 
@@ -209,10 +219,10 @@ order_vec_data_dirs_small_first() {
   local name x
   for name in "${candidates[@]}"; do [[ -n "${name}" ]] && want["$name"]=1; done
   local -a out=() rest=()
-  for x in "${DATASET_ORDER_SMALL_FIRST[@]}"; do
-    if [[ -n "${want[$x]:-}" ]] && [[ -d "${root}/${x}" ]]; then
-      out+=("$x"); seen["$x"]=1
-    fi
+  for x in "${_SWEEP_DATASET_ORDER[@]}" "${DATASET_ORDER_SMALL_FIRST[@]}"; do
+    [[ -n "${seen[$x]:-}" ]] || [[ -z "${want[$x]:-}" ]] || [[ ! -d "${root}/${x}" ]] && continue
+    out+=("$x")
+    seen["$x"]=1
   done
   for name in "${candidates[@]}"; do
     [[ -n "${name}" ]] || continue
@@ -232,9 +242,9 @@ if [[ -n "${ONLY_DIRS:-}" ]]; then
   # shellcheck disable=SC2206
   mapfile -t _raw < <(printf '%s\n' ${ONLY_DIRS})
 elif [[ "${SWEEP_DISCOVER_ALL_DIRS:-0}" == "1" ]]; then
-  mapfile -t _raw < <(find "${VEC_DATA_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+  mapfile -t _raw < <(find "${VEC_DATA_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
 else
-  mapfile -t _raw < <(printf '%s\n' "${DATASET_ORDER_SMALL_FIRST[@]}")
+  mapfile -t _raw < <(printf '%s\n' ${_SWEEP_DATASET_ORDER[@]})
 fi
 mapfile -t _discovered < <(order_vec_data_dirs_small_first "${VEC_DATA_ROOT}" "${_raw[@]}")
 

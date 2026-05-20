@@ -69,6 +69,14 @@ int ObDASScanIter::inner_release()
   return ret;
 }
 
+void ObDASScanIter::revert_storage_scan_iter_if_any()
+{
+  if (OB_NOT_NULL(result_)) {
+    (void)tsc_service_->revert_scan_iter(result_);
+    result_ = nullptr;
+  }
+}
+
 int ObDASScanIter::do_table_scan()
 {
   int ret = OB_SUCCESS;

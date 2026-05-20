@@ -14,6 +14,7 @@
 #include "share/vector_index/ob_plugin_vector_index_service.h"
 #include "share/ob_ls_id.h"
 #include "share/vector_index/ob_vector_index_ivf_cache_util.h"
+#include "share/vector_index/ob_ivf_cid_cluster_cache.h"
 
 namespace oceanbase
 {
@@ -39,6 +40,9 @@ int ObIvfAsyncTask::delete_deprecated_cache(ObPluginVectorIndexService &vector_i
     } else {  // already removed
       ret = OB_SUCCESS;
     }
+  }
+  if (OB_SUCC(ret)) {
+    invalidate_ivf_cid_cluster_cache_for_index_tablet(tenant_id_, ctx_->task_status_.tablet_id_);
   }
   return ret;
 }

@@ -312,7 +312,7 @@ class ObIvfAadaptiveCtx
 /// Enable with OB_IVF_LATENCY_BREAKDOWN=1 on observer.
 /// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N=N (optional): only one observer worker thread (owner, pinned by
 /// first IVF scan after idle or startup) counts queries; while (indexed row estimate, dim, nlist) stay unchanged,
-/// emit every N-th IVF process_ivf_scan on that thread (N defaults to 10). The first such scan after a
+/// emit every N-th IVF process_ivf_scan on that thread (N defaults to 4). The first such scan after a
 /// dataset-key change counts as query 1 and is emitted. Other threads skip breakdown (no timers / no log).
 /// If wall time since the previous IVF scan exceeds ~60s (benchmark idle), the owner pin resets so the next
 /// scan can claim ownership again.
@@ -352,6 +352,8 @@ struct ObIvfLatencyBreakdown {
     fine_heap_finalize_us_ = 0;
     brute_wall_us_ = 0;
     sq8_prep_us_ = 0;
+    pq_prep_us_ = 0;
+    flat_prep_us_ = 0;
   }
   bool enabled_{false};
   int64_t ivf_total_us_{0};
@@ -394,6 +396,10 @@ struct ObIvfLatencyBreakdown {
   int64_t brute_wall_us_{0};
   /// ObDASIvfSQ8ScanIter::process_ivf_scan_pre only: prep before do_ivf_scan_pre.
   int64_t sq8_prep_us_{0};
+  /// ObDASIvfPQScanIter::calc_nearest_limit_rowkeys_in_cids: residual split / precompute table setup.
+  int64_t pq_prep_us_{0};
+  /// VIAT_IVF_FLAT do_ivf_scan_pre only: rowkey prefilter fetch + prefilter structure build (excludes coarse/fine scan).
+  int64_t flat_prep_us_{0};
 };
 
 class ObDASIvfBaseScanIter : public ObDASIter

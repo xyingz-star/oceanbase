@@ -15,6 +15,8 @@
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/ob_das_hnsw_scan_iter.h"
 #include "sql/das/iter/ob_das_ivf_scan_iter.h"
+#include "sql/das/iter/ob_das_ivf_cid_vec_cache_scan_iter.h"
+#include "share/vector_index/ob_ivf_cid_cluster_cache.h"
 #include "sql/das/iter/ob_das_spiv_merge_iter.h"
 #include "sql/das/iter/ob_das_spiv_scan_iter.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
@@ -1038,6 +1040,51 @@ int ObDASIterUtils::create_das_scan_iter(common::ObIAllocator &alloc,
     }
   }
 
+  return ret;
+}
+
+int ObDASIterUtils::create_das_ivf_cid_vec_cache_scan_iter(
+    common::ObIAllocator &alloc,
+    const ObDASScanCtDef *scan_ctdef,
+    ObDASScanRtDef *scan_rtdef,
+    transaction::ObTxReadSnapshot *snapshot,
+    const ObDASVecAuxScanCtDef *vec_aux_ctdef,
+    const ObDASScanCtDef *data_table_ctdef,
+    const ObDASRelatedTabletID &related_tablet_ids,
+    ObDASScanIter *&iter_tree)
+{
+  int ret = OB_SUCCESS;
+  iter_tree = nullptr;
+  (void)snapshot;
+  if (OB_ISNULL(scan_ctdef) || OB_ISNULL(scan_rtdef) || OB_ISNULL(vec_aux_ctdef)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected nullptr", K(ret), KP(scan_ctdef), KP(scan_rtdef), KP(vec_aux_ctdef));
+  } else if (!share::is_ivf_cid_cluster_cache_enabled()) {
+    ret = create_das_scan_iter(alloc, scan_ctdef, scan_rtdef, iter_tree);
+  } else {
+    ObDASIvfCidVecCacheScanIterParam param;
+    init_scan_iter_param(param, scan_ctdef, scan_rtdef);
+    param.algo_ = vec_aux_ctdef->algorithm_type_;
+    param.cid_vec_ctdef_ = scan_ctdef;
+    share::ObIvfCidClusterCacheMgrKey cache_key;
+    cache_key.tenant_id_ = MTL_ID();
+    // Align with ObIvfCacheMgrKey / IVF async task tablet_id (centroid tablet), not cid_vec aux tablet.
+    cache_key.index_tablet_id_ = related_tablet_ids.centroid_tablet_id_;
+    cache_key.cid_vec_table_id_ = scan_ctdef->ref_table_id_;
+    cache_key.data_table_id_ = OB_NOT_NULL(data_table_ctdef) ? data_table_ctdef->ref_table_id_ : OB_INVALID_ID;
+    cache_key.algorithm_type_ = vec_aux_ctdef->algorithm_type_;
+    ObDASIvfCidVecCacheScanIter *cache_iter = nullptr;
+    if (OB_FAIL(share::acquire_ivf_cid_cluster_cache(cache_key, param.cluster_cache_))) {
+      LOG_WARN("failed to acquire cid cluster cache", K(ret), K(cache_key));
+    } else if (OB_FAIL(create_das_iter<ObDASIvfCidVecCacheScanIter>(alloc, param, cache_iter))) {
+      LOG_WARN("failed to create ivf cid vec cache scan iter", K(ret));
+    } else {
+      iter_tree = cache_iter;
+    }
+    if (OB_FAIL(ret) && OB_NOT_NULL(param.cluster_cache_)) {
+      share::release_ivf_cid_cluster_cache(param.cluster_cache_);
+    }
+  }
   return ret;
 }
 
@@ -5359,12 +5406,16 @@ int ObDASIterUtils::create_vec_ivf_lookup_tree(ObTableScanParam &scan_param,
                    vec_aux_rtdef->get_vec_aux_tbl_rtdef(vec_aux_ctdef->get_ivf_centroid_tbl_idx()),
                    centroid_table_iter))) {
       LOG_WARN("failed to create delta buf table iter", K(ret));
-    } else if (OB_FAIL(
-                   create_das_scan_iter(alloc,
-                                        vec_aux_ctdef->get_vec_aux_tbl_ctdef(vec_aux_ctdef->get_ivf_cid_vec_tbl_idx(),
-                                                                             ObTSCIRScanType::OB_VEC_IVF_CID_VEC_SCAN),
-                                        vec_aux_rtdef->get_vec_aux_tbl_rtdef(vec_aux_ctdef->get_ivf_cid_vec_tbl_idx()),
-                                        cid_vec_table_iter))) {
+    } else if (OB_FAIL(create_das_ivf_cid_vec_cache_scan_iter(
+                   alloc,
+                   vec_aux_ctdef->get_vec_aux_tbl_ctdef(vec_aux_ctdef->get_ivf_cid_vec_tbl_idx(),
+                                                        ObTSCIRScanType::OB_VEC_IVF_CID_VEC_SCAN),
+                   vec_aux_rtdef->get_vec_aux_tbl_rtdef(vec_aux_ctdef->get_ivf_cid_vec_tbl_idx()),
+                   snapshot,
+                   vec_aux_ctdef,
+                   data_table_ctdef,
+                   related_tablet_ids,
+                   cid_vec_table_iter))) {
       LOG_WARN("failed to create index id table iter", K(ret));
     } else if (OB_FAIL(create_das_scan_iter(
                    alloc,

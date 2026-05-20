@@ -152,6 +152,14 @@ private:
                                   const ObDASScanCtDef *scan_ctdef,
                                   ObDASScanRtDef *scan_rtdef,
                                   ObDASScanIter *&iter_tree);
+  static int create_das_ivf_cid_vec_cache_scan_iter(common::ObIAllocator &alloc,
+                                                    const ObDASScanCtDef *scan_ctdef,
+                                                    ObDASScanRtDef *scan_rtdef,
+                                                    transaction::ObTxReadSnapshot *snapshot,
+                                                    const ObDASVecAuxScanCtDef *vec_aux_ctdef,
+                                                    const ObDASScanCtDef *data_table_ctdef,
+                                                    const ObDASRelatedTabletID &related_tablet_ids,
+                                                    ObDASScanIter *&iter_tree);
 
   static int create_das_scan_with_merge_iter(storage::ObTableScanParam &scan_param,
                                              common::ObIAllocator &alloc,

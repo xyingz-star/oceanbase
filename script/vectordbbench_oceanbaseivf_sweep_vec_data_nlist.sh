@@ -9,7 +9,8 @@
 # 与 observer 同机且可读即可，无需改代码重编、无需重启 observer。
 # 1536D5M 在 resolve_case_type 中注释；768D10M 默认由 SWEEP_SKIP_DIRS 排除（不跑、不依赖 CaseType）。
 # 检索：串行阶段保留（recall/ndcg）；并发阶段仅一档 VDB_NUM_CONCURRENCY（默认 80）。不要串行可设 VDB_SKIP_SEARCH_SERIAL=1。
-# 数据集：默认 **仅 1536D500K**。多数据集：ONLY_DIRS="1536D50K 1536D500K"；全盘发现：SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS）。
+# 数据集：默认 **1536D50K 1536D500K 768D1M**（可用 SWEEP_DATASETS 覆盖）。ONLY_DIRS=... 限定子集；全盘发现：SWEEP_DISCOVER_ALL_DIRS=1。
+# 索引：默认 IVF_FLAT（INDEX_TYPE=ivf_flat，见 vectordbbench_oceanbaseivf_single.sh）。
 # 常用：SWEEP_DAEMONIZE=1  VEC_DATA_ROOT=...
 #
 # ---------- 自动表 / 数据 / 索引策略（默认开，无需再 export VDB_SKIP_* / VDB_REBUILD_*）----------
@@ -73,11 +74,15 @@ SWEEP_SKIP_DIRS="${SWEEP_SKIP_DIRS:-768D10M}"
 export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-80}"
 # 1=按表行数自动设置 VDB_SKIP_DROP_OLD / VDB_SKIP_LOAD / VDB_REBUILD_INDEX；0=沿用环境变量
 SWEEP_AUTO_OB_STAGES="${SWEEP_AUTO_OB_STAGES:-1}"
+# 默认扫三个标准 vec_data 子目录（小→大）；空格分隔，相对 VEC_DATA_ROOT
+SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K 1536D500K 768D1M}"
+export INDEX_TYPE="${INDEX_TYPE:-ivf_flat}"
 
-# 遍历顺序：先小数据再大数据；其余目录按名字排序接在后面（不再对每个未列名目录打 WARN）
+# 遍历顺序：先 SWEEP_DATASETS 中存在的目录，再 ONLY_DIRS / discover 的其余目录按名字排序
 DATASET_ORDER_SMALL_FIRST=(
   1536D50K 1536D500K 768D1M cohere openai 1536D5M 768D100K 768D10M
 )
+read -r -a _SWEEP_DATASET_ORDER <<< "${SWEEP_DATASETS}"
 
 [[ -f "${INNER}" ]] || { echo "ERROR: missing ${INNER}" >&2; exit 1; }
 
@@ -239,10 +244,10 @@ order_vec_data_dirs_small_first() {
   local name x
   for name in "${candidates[@]}"; do [[ -n "${name}" ]] && want["$name"]=1; done
   local -a out=() rest=()
-  for x in "${DATASET_ORDER_SMALL_FIRST[@]}"; do
-    if [[ -n "${want[$x]:-}" ]] && [[ -d "${root}/${x}" ]]; then
-      out+=("$x"); seen["$x"]=1
-    fi
+  for x in "${_SWEEP_DATASET_ORDER[@]}" "${DATASET_ORDER_SMALL_FIRST[@]}"; do
+    [[ -n "${seen[$x]:-}" ]] || [[ -z "${want[$x]:-}" ]] || [[ ! -d "${root}/${x}" ]] && continue
+    out+=("$x")
+    seen["$x"]=1
   done
   for name in "${candidates[@]}"; do
     [[ -n "${name}" ]] || continue
@@ -264,7 +269,7 @@ if [[ -n "${ONLY_DIRS:-}" ]]; then
 elif [[ "${SWEEP_DISCOVER_ALL_DIRS:-0}" == "1" ]]; then
   mapfile -t _raw < <(find "${VEC_DATA_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
 else
-  mapfile -t _raw < <(printf '%s\n' 1536D500K)
+  mapfile -t _raw < <(printf '%s\n' ${_SWEEP_DATASET_ORDER[@]})
 fi
 mapfile -t _discovered < <(order_vec_data_dirs_small_first "${VEC_DATA_ROOT}" "${_raw[@]}")
 
