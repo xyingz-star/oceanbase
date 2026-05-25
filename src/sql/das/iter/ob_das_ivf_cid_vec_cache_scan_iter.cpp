@@ -589,13 +589,39 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
   return ret;
 }
 
+int ObDASIvfCidVecCacheScanIter::replay_materialize_at(const int64_t row_idx, const int64_t batch_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(replay_entry_) || OB_ISNULL(replay_entry_->kv_flat_buf_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const share::ObIvfCidFlatHeader *hdr =
+        reinterpret_cast<const share::ObIvfCidFlatHeader *>(replay_entry_->kv_flat_buf_);
+    share::ObIvfCidClusterRow row;
+    ObObj rk_objs[OB_MAX_ROWKEY_COLUMN_NUMBER];
+    if (OB_FAIL(share::ivf_cid_flat_replay_row_at(replay_entry_->kv_flat_buf_,
+            hdr->flat_buf_len_,
+            row_idx,
+            row,
+            rk_objs,
+            OB_MAX_ROWKEY_COLUMN_NUMBER))) {
+      LOG_WARN("failed to replay flat row", K(ret), K(row_idx), K(hdr->cid_));
+    } else if (OB_FAIL(materialize_row_to_eval(row, batch_idx))) {
+      LOG_WARN("failed to materialize replay row", K(ret), K(row_idx));
+    }
+  }
+  return ret;
+}
+
 int ObDASIvfCidVecCacheScanIter::replay_one_row()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->rows_.count()) {
+  if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->row_count_) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(materialize_row_to_eval(replay_entry_->rows_.at(replay_idx_++), 0))) {
-    LOG_WARN("failed to materialize replay row", K(ret));
+  } else if (OB_FAIL(replay_materialize_at(replay_idx_++, 0))) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to replay row", K(ret));
+    }
   } else {
     session_stats_.replay_row_cnt_++;
     mark_materialized_batch(1);
@@ -608,10 +634,10 @@ int ObDASIvfCidVecCacheScanIter::replay_rows(int64_t &count, int64_t capacity)
   int ret = OB_SUCCESS;
   count = 0;
   while (OB_SUCC(ret) && count < capacity) {
-    if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->rows_.count()) {
+    if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->row_count_) {
       ret = OB_ITER_END;
-    } else if (OB_FAIL(materialize_row_to_eval(replay_entry_->rows_.at(replay_idx_++), count))) {
-      LOG_WARN("failed to materialize replay row", K(ret));
+    } else if (OB_FAIL(replay_materialize_at(replay_idx_++, count))) {
+      LOG_WARN("failed to replay row", K(ret));
     } else {
       if (count < MATERIALIZED_BATCH_CAP) {
         materialized_batch_[count] = 1;

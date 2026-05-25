@@ -944,17 +944,15 @@ int ObIvfCidClusterCache::load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch
     return OB_HASH_NOT_EXIST;
   }
   ObIvfCidClusterEntry *view_entry = nullptr;
-  ObObj *rk_objs = nullptr;
-  int64_t rk_cnt = 0;
-  if (OB_FAIL(ivf_cid_flat_attach_entry(flat_buf, flat_len, view_entry, rk_objs, rk_cnt))) {
-    LOG_WARN("failed to attach flat entry", K(ret), K(cid));
+  if (OB_FAIL(ivf_cid_flat_open_replay_entry(flat_buf, flat_len, view_entry))) {
+    LOG_WARN("failed to open flat replay entry", K(ret), K(cid));
     return ret;
   }
   prep.flat_buf_ = flat_buf;
   prep.flat_len_ = flat_len;
   prep.view_entry_ = view_entry;
-  prep.rowkey_objs_ = rk_objs;
-  prep.rowkey_obj_cnt_ = rk_cnt;
+  prep.rowkey_objs_ = nullptr;
+  prep.rowkey_obj_cnt_ = 0;
   if (OB_FAIL(prep.kv_handle_.assign(kv_handle))) {
     LOG_WARN("failed to assign kv handle for kv entry prep", K(ret), K(cid));
     discard_kv_entry_prep_(prep);

@@ -207,3 +207,15 @@ gdb -batch -ex 'bt full' /path/to/observer core
 3. **pin 方案同样具有此 bug**；其 pin 快路径、per-CID 锁、`put_skip_pinned` 仅 **降低** `get_flat`/LRU 迁移频率，**不能**从机制上消除。
 4. **KV-only 在 conc=80 下更易复现**，因每次 HIT 都 `get_flat` 且无 per-CID 串行化。
 5. **正确修复**应在 KV 层（policy / move / deep_copy 契约），而非恢复 pin map。
+
+---
+
+## 9. 已实施修复（长期 Value + buf_ + 零拷贝）
+
+memblock 布局改为 **`[ ObIvfCidClusterFlatValue | align | ICFL ]`**：
+
+- `deep_copy`：placement-new `FlatValue`，`buf_` 指向同块内 ICFL；LRU `internal_data_move` 走虚 `deep_copy` 时从 `buf_`/`buf_len_` 正确 memcpy。
+- `get_flat`：经 `stored->buf()` 取 ICFL，REPLAY attach 仍零拷贝。
+- **兼容**：旧 entry（`value_` 直接指向裸 ICFL）在 `ivf_cid_flat_resolve_icfl_source` 中识别并在 get/migrate 时转为新布局。
+
+见 `ob_ivf_cid_cluster_kv_cache.{h,cpp}` 中 `ivf_cid_flat_value_storage_size` / `ivf_cid_flat_write_value_layout`。

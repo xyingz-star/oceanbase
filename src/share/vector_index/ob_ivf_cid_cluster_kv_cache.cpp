@@ -42,6 +42,76 @@ static int64_t ivf_cid_flat_header_and_tables_size(const int64_t row_count)
 
 static int64_t align8(const int64_t v) { return (v + 7) & ~static_cast<int64_t>(7); }
 
+static int64_t ivf_cid_flat_value_icfl_offset()
+{
+  return align8(static_cast<int64_t>(sizeof(ObIvfCidClusterFlatValue)));
+}
+
+int64_t ivf_cid_flat_value_storage_size(const int64_t icfl_len)
+{
+  return icfl_len > 0 ? ivf_cid_flat_value_icfl_offset() + icfl_len : 0;
+}
+
+static bool ivf_cid_flat_header_valid(const ObIvfCidFlatHeader *hdr, const int64_t avail_len)
+{
+  return OB_NOT_NULL(hdr)
+      && hdr->magic_ == ObIvfCidFlatHeader::MAGIC
+      && hdr->version_ == ObIvfCidFlatHeader::VERSION
+      && hdr->flat_buf_len_ > 0
+      && hdr->flat_buf_len_ <= INT64_MAX / 2
+      && hdr->flat_buf_len_ <= avail_len;
+}
+
+static int ivf_cid_flat_resolve_icfl_source(const ObIvfCidClusterFlatValue *stored,
+    const char *&icfl_src,
+    int64_t &icfl_len)
+{
+  int ret = OB_SUCCESS;
+  icfl_src = nullptr;
+  icfl_len = 0;
+  if (OB_ISNULL(stored)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_NOT_NULL(stored->buf()) && stored->buf_len() > 0) {
+    const ObIvfCidFlatHeader *hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(stored->buf());
+    if (!ivf_cid_flat_header_valid(hdr, stored->buf_len())) {
+      ret = OB_INVALID_DATA;
+    } else {
+      icfl_src = stored->buf();
+      icfl_len = hdr->flat_buf_len_;
+    }
+  } else {
+    const ObIvfCidFlatHeader *hdr_at_value = reinterpret_cast<const ObIvfCidFlatHeader *>(stored);
+    if (!ivf_cid_flat_header_valid(hdr_at_value, INT64_MAX)) {
+      ret = OB_INVALID_DATA;
+    } else {
+      // Legacy memblock: Node->value_ pointed at raw ICFL header.
+      icfl_src = reinterpret_cast<const char *>(stored);
+      icfl_len = hdr_at_value->flat_buf_len_;
+    }
+  }
+  return ret;
+}
+
+static int ivf_cid_flat_write_value_layout(char *buf,
+    const int64_t buf_len,
+    const char *icfl_src,
+    const int64_t icfl_len,
+    common::ObIKVCacheValue *&value)
+{
+  int ret = OB_SUCCESS;
+  value = nullptr;
+  const int64_t need = ivf_cid_flat_value_storage_size(icfl_len);
+  if (OB_ISNULL(buf) || OB_ISNULL(icfl_src) || icfl_len <= 0 || buf_len < need) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    char *icfl_dst = buf + ivf_cid_flat_value_icfl_offset();
+    MEMCPY(icfl_dst, icfl_src, icfl_len);
+    ObIvfCidClusterFlatValue *val = new (buf) ObIvfCidClusterFlatValue(icfl_dst, icfl_len);
+    value = val;
+  }
+  return ret;
+}
+
 // --- ObIvfCidClusterKVKey ---
 
 ObIvfCidClusterKVKey::ObIvfCidClusterKVKey() : mgr_key_(), cid_(0) {}
@@ -98,19 +168,18 @@ ObIvfCidClusterFlatValue::ObIvfCidClusterFlatValue(const char *buf, const int64_
 
 int64_t ObIvfCidClusterFlatValue::size() const
 {
-  return buf_len_;
+  return ivf_cid_flat_value_storage_size(buf_len_);
 }
 
 int ObIvfCidClusterFlatValue::deep_copy(char *buf, const int64_t buf_len, ObIKVCacheValue *&value) const
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(buf) || buf_len < size() || OB_ISNULL(buf_) || buf_len_ <= 0) {
-    ret = OB_INVALID_ARGUMENT;
-  } else {
-    // Store only the ICFL flat blob in the memblock. Do not placement-new FlatValue at buf[0]:
-    // that overwrites magic_/index_epoch_ and breaks REPLAY (stale epoch, get_hit=0).
-    MEMCPY(buf, buf_, buf_len_);
-    value = reinterpret_cast<ObIKVCacheValue *>(buf);
+  value = nullptr;
+  const char *icfl_src = nullptr;
+  int64_t icfl_len = 0;
+  if (OB_FAIL(ivf_cid_flat_resolve_icfl_source(this, icfl_src, icfl_len))) {
+  } else if (OB_FAIL(ivf_cid_flat_write_value_layout(buf, buf_len, icfl_src, icfl_len, value))) {
+    LOG_WARN("failed to write ivf cid flat value layout", K(ret), K(icfl_len), K(buf_len));
   }
   return ret;
 }
@@ -417,6 +486,141 @@ void ivf_cid_flat_free_buf(char *buf)
   }
 }
 
+static int ivf_cid_flat_header_tables_(const char *flat_buf,
+    const int64_t flat_len,
+    const ObIvfCidFlatHeader *&hdr,
+    const int64_t *&payload_off_tbl,
+    const int32_t *&payload_len_tbl,
+    const int64_t *&rowkey_off_tbl,
+    const int32_t *&rowkey_len_tbl)
+{
+  int ret = OB_SUCCESS;
+  hdr = nullptr;
+  payload_off_tbl = nullptr;
+  payload_len_tbl = nullptr;
+  rowkey_off_tbl = nullptr;
+  rowkey_len_tbl = nullptr;
+  if (OB_ISNULL(flat_buf) || flat_len < static_cast<int64_t>(sizeof(ObIvfCidFlatHeader))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(flat_buf);
+    if (hdr->magic_ != ObIvfCidFlatHeader::MAGIC || hdr->version_ != ObIvfCidFlatHeader::VERSION) {
+      ret = OB_INVALID_DATA;
+    } else if (hdr->row_count_ <= 0 || hdr->row_count_ > flat_len) {
+      ret = OB_INVALID_DATA;
+    } else {
+      payload_off_tbl = reinterpret_cast<const int64_t *>(flat_buf + sizeof(ObIvfCidFlatHeader));
+      payload_len_tbl = reinterpret_cast<const int32_t *>(
+          flat_buf + sizeof(ObIvfCidFlatHeader) + hdr->row_count_ * sizeof(int64_t));
+      rowkey_off_tbl = reinterpret_cast<const int64_t *>(
+          flat_buf + sizeof(ObIvfCidFlatHeader)
+          + hdr->row_count_ * (sizeof(int64_t) + sizeof(int32_t)));
+      rowkey_len_tbl = reinterpret_cast<const int32_t *>(
+          flat_buf + sizeof(ObIvfCidFlatHeader)
+          + hdr->row_count_ * (sizeof(int64_t) + sizeof(int32_t) + sizeof(int64_t)));
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_open_replay_entry(const char *flat_buf,
+    const int64_t flat_len,
+    ObIvfCidClusterEntry *&out_entry)
+{
+  int ret = OB_SUCCESS;
+  out_entry = nullptr;
+  const ObIvfCidFlatHeader *hdr = nullptr;
+  const int64_t *payload_off_tbl = nullptr;
+  const int32_t *payload_len_tbl = nullptr;
+  const int64_t *rowkey_off_tbl = nullptr;
+  const int32_t *rowkey_len_tbl = nullptr;
+  if (OB_FAIL(ivf_cid_flat_header_tables_(flat_buf, flat_len, hdr, payload_off_tbl, payload_len_tbl,
+          rowkey_off_tbl, rowkey_len_tbl))) {
+  } else {
+    ObIvfCidClusterEntry *entry = OB_NEW(ObIvfCidClusterEntry, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidView"));
+    if (OB_ISNULL(entry)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      UNUSED(payload_off_tbl);
+      UNUSED(payload_len_tbl);
+      UNUSED(rowkey_off_tbl);
+      UNUSED(rowkey_len_tbl);
+      entry->index_epoch_ = hdr->index_epoch_;
+      entry->cid_ = hdr->cid_;
+      entry->row_count_ = hdr->row_count_;
+      entry->entry_bytes_ = hdr->entry_bytes_;
+      entry->heat_.access_cnt_ = hdr->access_cnt_;
+      entry->heat_.replay_cnt_ = hdr->replay_cnt_;
+      entry->heat_.fill_cnt_ = hdr->fill_cnt_;
+      entry->heat_.last_access_us_ = hdr->last_access_us_;
+      entry->arena_ = nullptr;
+      entry->kv_flat_buf_ = flat_buf;
+      entry->rowkey_objs_ = nullptr;
+      if (hdr->reserved_[0] != 0) {
+        entry->payloads_l2_unit_known_ = true;
+        entry->payloads_l2_unit_ = (hdr->reserved_[1] != 0);
+      }
+      out_entry = entry;
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_replay_row_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    ObIvfCidClusterRow &out_row,
+    ObObj *rk_scratch,
+    const int64_t rk_scratch_cap)
+{
+  int ret = OB_SUCCESS;
+  out_row = ObIvfCidClusterRow();
+  const ObIvfCidFlatHeader *hdr = nullptr;
+  const int64_t *payload_off_tbl = nullptr;
+  const int32_t *payload_len_tbl = nullptr;
+  const int64_t *rowkey_off_tbl = nullptr;
+  const int32_t *rowkey_len_tbl = nullptr;
+  if (OB_FAIL(ivf_cid_flat_header_tables_(flat_buf, flat_len, hdr, payload_off_tbl, payload_len_tbl,
+          rowkey_off_tbl, rowkey_len_tbl))) {
+  } else if (row_idx < 0 || row_idx >= hdr->row_count_) {
+    ret = OB_ARRAY_OUT_OF_RANGE;
+  } else {
+    out_row.payload_type_ = static_cast<ObIvfCidClusterPayloadType>(hdr->payload_type_);
+    out_row.payload_len_ = payload_len_tbl[row_idx];
+    const int64_t poff = payload_off_tbl[row_idx];
+    out_row.payload_ = (out_row.payload_len_ > 0 && poff >= 0 && poff + out_row.payload_len_ <= flat_len)
+        ? flat_buf + poff
+        : nullptr;
+    const int32_t rk_len = rowkey_len_tbl[row_idx];
+    const int64_t rk_off = rowkey_off_tbl[row_idx];
+    if (rk_len < 0 || rk_off < 0 || rk_off + rk_len > flat_len) {
+      ret = OB_INVALID_DATA;
+    } else if (rk_len <= 0) {
+      // empty rowkey
+    } else {
+      int64_t pos = rk_off;
+      int64_t obj_cnt = 0;
+      if (OB_FAIL(serialization::decode_vi64(flat_buf, flat_len, pos, &obj_cnt))) {
+        LOG_WARN("failed to decode rowkey obj cnt", K(ret), K(row_idx));
+      } else if (obj_cnt <= 0) {
+        // empty rowkey
+      } else if (obj_cnt > rk_scratch_cap) {
+        ret = OB_BUF_NOT_ENOUGH;
+      } else {
+        ObRowkey rk;
+        pos = rk_off;
+        rk.assign(rk_scratch, obj_cnt);
+        if (OB_FAIL(ObTableSerialUtil::deserialize(flat_buf, flat_len, pos, rk))) {
+          LOG_WARN("failed to deserialize rowkey", K(ret), K(row_idx));
+        } else {
+          out_row.rowkey_ = rk;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ivf_cid_flat_attach_entry(const char *flat_buf,
     const int64_t flat_len,
     ObIvfCidClusterEntry *&out_entry,
@@ -579,14 +783,13 @@ int ObIvfCidClusterKVCache::get_flat(
   } else if (OB_ISNULL(stored)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    flat_buf = reinterpret_cast<const char *>(stored);
-    const ObIvfCidFlatHeader *hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(flat_buf);
-    if (hdr->magic_ != ObIvfCidFlatHeader::MAGIC || hdr->version_ != ObIvfCidFlatHeader::VERSION) {
-      ret = OB_INVALID_DATA;
-    } else if (hdr->flat_buf_len_ <= 0 || hdr->flat_buf_len_ > INT64_MAX / 2) {
-      ret = OB_INVALID_DATA;
+    const char *icfl_src = nullptr;
+    int64_t icfl_len = 0;
+    if (OB_FAIL(ivf_cid_flat_resolve_icfl_source(stored, icfl_src, icfl_len))) {
+      LOG_WARN("failed to resolve ivf cid flat from kv value", K(ret), K(key));
     } else {
-      flat_len = hdr->flat_buf_len_;
+      flat_buf = icfl_src;
+      flat_len = icfl_len;
     }
   }
   return ret;

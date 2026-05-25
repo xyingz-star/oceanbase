@@ -23,7 +23,7 @@ namespace share
 
 extern const char *IVF_CID_KV_CACHE_NAME;
 
-/// Flat blob layout in KV memblock (single deep_copy on put; REPLAY reads in-place).
+/// ICFL payload layout (follows ObIvfCidClusterFlatValue in KV memblock; REPLAY reads via FlatValue::buf()).
 struct ObIvfCidFlatHeader
 {
   static const uint32_t MAGIC = 0x4943464C; // "ICFL"
@@ -61,7 +61,8 @@ public:
   uint64_t cid_;
 };
 
-/// Value is a contiguous flat buffer; deep_copy memcpy once into KV memblock.
+/// KV memblock layout: [ ObIvfCidClusterFlatValue | aligned pad | ICFL blob ].
+/// buf_ points at ICFL inside the same memblock after deep_copy; stack temps use external buf_ at put only.
 class ObIvfCidClusterFlatValue : public common::ObIKVCacheValue
 {
 public:
@@ -77,12 +78,15 @@ private:
   int64_t buf_len_;
 };
 
+/// Total KV value bytes for an ICFL blob of icfl_len (FlatValue header + aligned ICFL).
+int64_t ivf_cid_flat_value_storage_size(const int64_t icfl_len);
+
 class ObIvfCidClusterKVCache : public common::ObKVCache<ObIvfCidClusterKVKey, ObIvfCidClusterFlatValue>
 {
 public:
   int init_cache();
   int put_flat(const ObIvfCidClusterKVKey &key, const char *flat_buf, const int64_t flat_len, const bool overwrite);
-  /// On hit, flat_buf points at raw ICFL bytes inside the KV memblock (not a C++ wrapper).
+  /// On hit, flat_buf points at ICFL bytes (FlatValue::buf() in memblock; legacy raw ICFL still supported).
   int get_flat(const ObIvfCidClusterKVKey &key,
       const char *&flat_buf,
       int64_t &flat_len,
@@ -130,6 +134,19 @@ int ivf_cid_flat_attach_entry(const char *flat_buf,
     ObIvfCidClusterEntry *&out_entry,
     common::ObObj *&out_rowkey_objs,
     int64_t &out_rowkey_obj_cnt);
+
+/// REPLAY cursor: shell entry only (header fields + kv_flat_buf_; rows_ empty). No bulk attach.
+int ivf_cid_flat_open_replay_entry(const char *flat_buf,
+    const int64_t flat_len,
+    ObIvfCidClusterEntry *&out_entry);
+
+/// Materialize one row from flat blob; vector payload is zero-copy; rowkey decoded into rk_scratch.
+int ivf_cid_flat_replay_row_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    ObIvfCidClusterRow &out_row,
+    common::ObObj *rk_scratch,
+    const int64_t rk_scratch_cap);
 
 } // namespace share
 } // namespace oceanbase

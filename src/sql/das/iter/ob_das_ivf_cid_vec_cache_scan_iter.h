@@ -76,6 +76,7 @@ private:
   int append_fill_row(int64_t batch_idx = 0);
   int replay_one_row();
   int replay_rows(int64_t &count, int64_t capacity);
+  int replay_materialize_at(int64_t row_idx, int64_t batch_idx);
   share::ObIvfCidClusterPayloadType payload_type() const;
   int materialize_row_to_eval(const share::ObIvfCidClusterRow &row, int64_t batch_idx);
   /// Open storage scan if result_ is null (after REPLAY), else rescan. Used by FILL and MISS.

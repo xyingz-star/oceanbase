@@ -12,7 +12,7 @@
 |------|------|------|
 | DAS | `ObDASIvfCidVecCacheScanIter` | REPLAY / FILL / MISS |
 | 逻辑 | `ObIvfCidClusterCache` | per-CID 状态、fill gate、ledger |
-| 物理 | `ObIvfCidClusterKVCache` | ICFL flat；LRU / hazptr 由 ObKVCache 负责 |
+| 物理 | `ObIvfCidClusterKVCache` | ICFL flat；memblock = `[FlatValue | ICFL]`，`buf_` 指向块内 ICFL；LRU 迁移可安全 `deep_copy` |
 
 ---
 
@@ -46,7 +46,7 @@ int64_t ledger_bytes_total_;  // atomic，全局字节账
 ### lookup_cid
 
 1. `record_access_` → `ATOMIC_INC(probe_access)`
-2. `try_lookup_hit_` → **每次** `get_flat` + `ivf_cid_flat_attach_entry`；`session_owned_=true`，`session_kv_handle_` 保 blob 存活（ObKVCache hazptr）
+2. `try_lookup_hit_` → **每次** `get_flat` + `ivf_cid_flat_attach_entry`；`get_flat` 经 `FlatValue::buf()` 取 ICFL（REPLAY 仍零拷贝）；`session_kv_handle_` 保 memblock 存活
 3. miss → fill gate 判断 → FILL_LEADER 或 MISS
 
 ### put / FILL 写入
