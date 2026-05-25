@@ -88,8 +88,6 @@ struct ObIvfCidClusterEntry;
 struct ObIvfCidFlatFillState;
 struct ObIvfCidFillGate;
 struct ObIvfCidClusterCacheSessionStats;
-struct IvfPinFreeFn;
-struct IvfPinInvalidateFn;
 
 /// Per-CID lifecycle (atomic phase_ in cid_states_ after successful put).
 enum class ObIvfCidClusterCidPhase : int8_t
@@ -136,8 +134,6 @@ struct ObIvfCidPerCidState
 class ObIvfCidClusterCache
 {
   friend void release_ivf_cid_cluster_cache(ObIvfCidClusterCache *cache);
-  friend struct IvfPinFreeFn;
-  friend struct IvfPinInvalidateFn;
 
 public:
   ObIvfCidClusterCache();
@@ -148,7 +144,7 @@ public:
   uint64_t get_index_epoch() const { return load_index_epoch_(); }
   int64_t get_max_bytes() const { return max_bytes_; }
   ObIvfCidClusterCidPhase get_cid_phase(uint64_t cid) const;
-  /// Per-CID: HIT if READY in pin/KV; else FILL_LEADER when hot enough and space allows; else MISS.
+  /// Per-CID: HIT via ObKVCache only; else FILL_LEADER or MISS.
   int lookup_cid(uint64_t cid,
       ObIvfCidClusterEntry *&entry,
       ObIvfCidClusterLookupResult &result,
@@ -163,18 +159,9 @@ public:
   void log_stats(const char *tag) const;
 
 private:
-  struct ObIvfCidClusterPinSlot
+  struct ObIvfKvEntryPrep
   {
-    ObIvfCidClusterPinSlot() : view_entry_(nullptr), rowkey_objs_(nullptr), borrow_ref_cnt_(0) {}
-    ObIvfCidClusterEntry *view_entry_;
-    common::ObObj *rowkey_objs_;
-    common::ObKVCacheHandle kv_handle_;
-    /// Active REPLAY borrows; put_flat must not replace KV while > 0.
-    int64_t borrow_ref_cnt_;
-  };
-  struct ObIvfKvPinPrep
-  {
-    ObIvfKvPinPrep()
+    ObIvfKvEntryPrep()
       : flat_buf_(nullptr),
         flat_len_(0),
         view_entry_(nullptr),
@@ -188,33 +175,20 @@ private:
     int64_t rowkey_obj_cnt_;
     common::ObKVCacheHandle kv_handle_;
   };
-  /// Caller must hold pin_shard_lock_(cid). Serializes get_flat vs put_flat for this CID.
-  int load_kv_pin_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvPinPrep &prep);
-  void discard_kv_pin_prep_(ObIvfKvPinPrep &prep);
-  void release_pin_slot_(ObIvfCidClusterPinSlot *slot);
+  int load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvEntryPrep &prep);
+  void discard_kv_entry_prep_(ObIvfKvEntryPrep &prep);
   void ledger_drop_cached_(uint64_t cid, bool erase_kv = true);
   void ledger_commit_(uint64_t cid, int64_t bytes);
-  void release_dormant_pin_shard_locked_(const uint64_t cid, ObIvfCidClusterPinSlot *slot);
   bool probe_heat_meets_fill_threshold_(uint64_t cid) const;
   bool has_cache_space_(uint64_t cid, int64_t need_bytes) const;
   ObIvfCidPerCidState *cid_state_(uint64_t cid);
   const ObIvfCidPerCidState *cid_state_(uint64_t cid) const;
   void reset_all_cid_states_();
-  int install_pin_slot_locked_(uint64_t cid,
-      ObIvfCidClusterEntry *view_entry,
-      common::ObObj *rowkey_objs,
-      common::ObKVCacheHandle &kv_handle);
-  int warm_pin_slot_(uint64_t cid);
   void clear_all_fill_gates_();
-  static const int64_t IVF_CID_PIN_MAP_SHARD_CNT = 64;
-  int64_t pin_shard_idx_(uint64_t cid) const;
+  static const int64_t IVF_CID_FILL_GATE_SHARD_CNT = 64;
   int64_t fill_gate_shard_idx_(uint64_t cid) const;
-  common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> &pin_map_shard_(uint64_t cid);
-  const common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> &pin_map_shard_(uint64_t cid) const;
   common::hash::ObHashMap<uint64_t, ObIvfCidFillGate *> &fill_gate_map_shard_(uint64_t cid);
   const common::hash::ObHashMap<uint64_t, ObIvfCidFillGate *> &fill_gate_map_shard_(uint64_t cid) const;
-  lib::ObMutex &pin_shard_lock_(uint64_t cid);
-  const lib::ObMutex &pin_shard_lock_(uint64_t cid) const;
   lib::ObMutex &fill_gate_shard_lock_(uint64_t cid);
   const lib::ObMutex &fill_gate_shard_lock_(uint64_t cid) const;
   int ledger_remove_(uint64_t cid, bool erase_kv = true);
@@ -237,10 +211,8 @@ private:
   int64_t ref_cnt_;
   ObIvfCidPerCidState *cid_states_;
   ObIvfCidClusterCacheStats stats_;
-  common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> pin_map_shards_[IVF_CID_PIN_MAP_SHARD_CNT];
-  lib::ObMutex *pin_shard_locks_[IVF_CID_PIN_MAP_SHARD_CNT];
-  common::hash::ObHashMap<uint64_t, ObIvfCidFillGate *> fill_gate_map_shards_[IVF_CID_PIN_MAP_SHARD_CNT];
-  lib::ObMutex *fill_gate_shard_locks_[IVF_CID_PIN_MAP_SHARD_CNT];
+  common::hash::ObHashMap<uint64_t, ObIvfCidFillGate *> fill_gate_map_shards_[IVF_CID_FILL_GATE_SHARD_CNT];
+  lib::ObMutex *fill_gate_shard_locks_[IVF_CID_FILL_GATE_SHARD_CNT];
 };
 
 struct ObIvfCidClusterEntry
@@ -258,7 +230,6 @@ struct ObIvfCidClusterEntry
       payloads_l2_unit_known_(false),
       payloads_l2_unit_(false),
       session_owned_(false),
-      session_borrowed_(false),
       session_kv_handle_(),
       flat_fill_(nullptr)
   {}
@@ -276,7 +247,6 @@ struct ObIvfCidClusterEntry
   bool payloads_l2_unit_known_;
   bool payloads_l2_unit_;
   bool session_owned_;
-  bool session_borrowed_;
   common::ObKVCacheHandle session_kv_handle_;
   ObIvfCidFlatFillState *flat_fill_;
 };
