@@ -29,6 +29,7 @@
 #include "share/vector_type/ob_ivf_sq8_latent_fused_distance.h"
 #include "lib/file/file_directory_utils.h"
 #include "lib/ob_define.h"
+#include "lib/random/ob_random.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -302,6 +303,9 @@ OB_INLINE void ob_ivf_latency_breakdown_append_user_log(
   }
   char line[6144];
   const int64_t fine_cv_untracked_us = ob_ivf_latency_breakdown_fine_cv_untracked_us(lat);
+  const int64_t lat_cid_cluster_cache_active =
+      (cache_snap.valid_ && cache_snap.cache_active_) ? 1 : 0;
+  const int64_t lat_query_replay_cache = share::ob_ivf_cid_cluster_cache_query_hit_flag(cache_snap);
   const int nl = snprintf(
       line,
       sizeof(line),
@@ -313,7 +317,7 @@ OB_INLINE void ob_ivf_latency_breakdown_append_user_log(
       "fine_heap_finalize_us=%lld fine_cv_untracked_us=%lld brute_wall_us=%lld sq8_prep_us=%lld pq_prep_us=%lld "
       "flat_prep_us=%lld misc_us=%lld "
       "is_brute_force=%d cid_vec_scan_rows=%lld vec_dist_calc_cnt=%lld vec_index_type=%d dim=%lld "
-      "nprobes=%lld\n",
+      "nprobes=%lld cid_cluster_cache_active=%d query_cid_cache_hit=%d\n",
       static_cast<int>(is_vectorized),
       static_cast<long long>(lat.ivf_total_us_),
       static_cast<long long>(lat.finalize_us_),
@@ -346,7 +350,9 @@ OB_INLINE void ob_ivf_latency_breakdown_append_user_log(
       static_cast<long long>(vec_dist_calc_cnt),
       static_cast<int>(vec_index_type),
       static_cast<long long>(dim),
-      static_cast<long long>(nprobes));
+      static_cast<long long>(nprobes),
+      static_cast<int>(lat_cid_cluster_cache_active),
+      static_cast<int>(lat_query_replay_cache));
   if (nl > 0 && nl < static_cast<int>(sizeof(line))) {
     (void)::fwrite(line, 1, static_cast<size_t>(nl), fp);
   }
@@ -1066,6 +1072,11 @@ void ObDASIvfBaseScanIter::ivf_lat_log(const bool is_vectorized) const
   const int64_t fine_cv_untracked_us = ob_ivf_latency_breakdown_fine_cv_untracked_us(ivf_lat_);
   const int64_t misc_us =
       ivf_lat_.das_body_us_ - ivf_lat_.brute_wall_us_ - ivf_lat_.coarse_wall_us_ - ivf_lat_.fine_wall_us_;
+  share::ObIvfCidClusterCacheLogSnapshot cache_snap;
+  cache_snap.reset();
+  if (OB_NOT_NULL(cid_vec_iter_)) {
+    (void)ob_das_ivf_try_export_cid_cluster_cache_snapshot(cid_vec_iter_, cache_snap);
+  }
   LOG_INFO("[OB_IVF_LATENCY_BREAKDOWN]",
            K(is_vectorized),
            K(ivf_lat_.ivf_total_us_),
@@ -1102,11 +1113,6 @@ void ObDASIvfBaseScanIter::ivf_lat_log(const bool is_vectorized) const
            K(ivf_lat_.fine_cv_iter_reuse_us_),
            K(ivf_lat_.fine_heap_finalize_us_),
            K(fine_cv_untracked_us));
-  share::ObIvfCidClusterCacheLogSnapshot cache_snap;
-  cache_snap.reset();
-  if (OB_NOT_NULL(cid_vec_iter_)) {
-    (void)ob_das_ivf_try_export_cid_cluster_cache_snapshot(cid_vec_iter_, cache_snap);
-  }
   ob_ivf_latency_breakdown_append_user_log(is_vectorized,
       ivf_lat_,
       misc_us,
@@ -2179,6 +2185,33 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDi
 void ObDASIvfBaseScanIter::reuse_cid_ctx()
 {
   iterative_filter_ctx_.reuse();
+  probe_rotate_offset_ = 0;
+  probe_rotate_count_ = 0;
+}
+
+bool ObDASIvfBaseScanIter::ivf_probe_rotate_enabled()
+{
+  static int cached = -1;
+  if (cached < 0) {
+    const char *env = getenv("OB_IVF_PROBE_ROTATE");
+    // default on; set OB_IVF_PROBE_ROTATE=0 to disable
+    cached = (nullptr == env || '\0' == env[0] || (env[0] == '1' && '\0' == env[1])) ? 1 : 0;
+  }
+  return cached != 0;
+}
+
+void ObDASIvfBaseScanIter::assign_probe_rotate_offset_(const int64_t candidate_cnt)
+{
+  probe_rotate_count_ = candidate_cnt;
+  probe_rotate_offset_ = 0;
+  if (candidate_cnt > 1 && ivf_probe_rotate_enabled()) {
+    probe_rotate_offset_ = ObRandom::rand(0, candidate_cnt - 1);
+  }
+}
+
+int64_t ObDASIvfBaseScanIter::rotated_probe_idx_(const int64_t k) const
+{
+  return probe_rotate_count_ <= 0 ? k : (probe_rotate_offset_ + k) % probe_rotate_count_;
 }
 
 int64_t ObDASIvfBaseScanIter::get_cid_vec_batch_count()
@@ -2258,6 +2291,9 @@ int ObDASIvfScanIter::get_next_center_ids(bool is_vectorized, int64_t next_nprob
     if (OB_FAIL(iterative_filter_ctx_.get_next_nearest_probe_center_ids(next_nprobe, near_cid_))) {
       LOG_WARN("failed to get next nearest probe center ids", K(ret), K(next_nprobe));
     }
+  }
+  if (OB_SUCC(ret) && near_cid_.count() > 0) {
+    assign_probe_rotate_offset_(near_cid_.count());
   }
   return ret;
 }
@@ -2401,6 +2437,9 @@ int ObDASIvfScanIter::get_nearest_probe_center_ids(bool is_vectorized)
         ivf_lat_.coarse_compute_us_ += ObTimeUtility::current_time() - t_heap_beg;
       }
     }
+  }
+  if (OB_SUCC(ret) && near_cid_.count() > 0) {
+    assign_probe_rotate_offset_(near_cid_.count());
   }
   return ret;
 }
@@ -2904,7 +2943,8 @@ int ObDASIvfScanIter::get_nearest_limit_rowkeys_in_cids(
     // for adaptor old version(< 4353), which cid_vec is not normlized in cosine dis
     bool is_first_vec = true;
     bool cid_vec_need_norm = true;
-    for (int64_t i = 0; OB_SUCC(ret) && i < near_cid_.count(); ++i) {
+    for (int64_t k = 0; OB_SUCC(ret) && k < near_cid_.count(); ++k) {
+      const int64_t i = rotated_probe_idx_(k);
       const ObCenterId &cur_cid = near_cid_.at(i);
       if (OB_FALSE_IT(cid_str.assign_buffer(buf, buf_len))) {
       } else {
@@ -3870,7 +3910,8 @@ int ObDASIvfPQScanIter::calc_nearest_limit_rowkeys_in_cids(
     ivf_lat_.pq_prep_us_ += ObTimeUtility::current_time() - t_pq_prep_beg;
   }
   // 1. for every (cid, cid_vec),
-  for (int i = 0; OB_SUCC(ret) && i < near_cid_vec_.count(); ++i) {
+  for (int64_t k = 0; OB_SUCC(ret) && k < near_cid_vec_.count(); ++k) {
+    const int64_t i = rotated_probe_idx_(k);
     const ObCenterId &cur_cid = near_cid_vec_.at(i).first;
     float *cur_cid_vec = near_cid_vec_.at(i).second;
     float dis0 = 0.0f;
@@ -4129,6 +4170,9 @@ int ObDASIvfPQScanIter::get_next_centers(bool is_vectorized, int64_t next_nprobe
       LOG_WARN("failed to get next nearest probe centers vec dist", K(ret), K(next_nprobe));
     }
   }
+  if (OB_SUCC(ret) && near_cid_vec_.count() > 0) {
+    assign_probe_rotate_offset_(near_cid_vec_.count());
+  }
   return ret;
 }
 
@@ -4292,6 +4336,9 @@ int ObDASIvfPQScanIter::get_nearest_probe_centers(bool is_vectorized)
         }
       }
     }
+  }
+  if (OB_SUCC(ret) && near_cid_vec_.count() > 0) {
+    assign_probe_rotate_offset_(near_cid_vec_.count());
   }
   return ret;
 }

@@ -324,6 +324,9 @@ class ObIvfAadaptiveCtx
 /// the same (append to one file); when any of the three changes, a new log path is resolved (new file).
 /// Custom templates without "%r/%m/%c" get ".n*_d*_c*" injected before ".log" so
 /// different datasets do not share one filename.
+/// Per-query cache flags on the breakdown line (see ob_ivf_cid_cluster_cache_query_hit_flag):
+///   cid_cluster_cache_active=1 — cid_vec iter exported a valid cache snapshot;
+///   query_cid_cache_hit=1 — at least one CID served via REPLAY this query.
 struct ObIvfLatencyBreakdown {
   void reset()
   {
@@ -461,7 +464,9 @@ public:
         hgraph_has_next_center_(true),
         has_used_hgraph_(false),
         strategy_(ObVecIdxQueryStrategy::RECALL_FIRST),
-        ivf_lat_()
+        ivf_lat_(),
+        probe_rotate_offset_(0),
+        probe_rotate_count_(0)
   {
     dis_type_ = ObExprVectorDistance::ObVecDisType::MAX_TYPE;
     saved_rowkeys_.set_attr(ObMemAttr(MTL_ID(), "VecIdxKeyRanges"));
@@ -605,6 +610,11 @@ protected:
   void ivf_lat_reset();
   void ivf_lat_log(const bool is_vectorized) const;
 
+  /// Random start within current probe candidate batch; ring index for cid_vec scan order.
+  static bool ivf_probe_rotate_enabled();
+  void assign_probe_rotate_offset_(int64_t candidate_cnt);
+  int64_t rotated_probe_idx_(int64_t k) const;
+
 protected:
   static const int64_t CENTROID_PRI_KEY_CNT = 1;
   static const int64_t CID_VEC_COM_KEY_CNT = 1;        // Only the vec column is a common column
@@ -698,6 +708,8 @@ protected:
   bool has_used_hgraph_;  // Flag to track if HGraph was used in initial search
   ObVecIdxQueryStrategy strategy_;
   ObIvfLatencyBreakdown ivf_lat_;
+  int64_t probe_rotate_offset_;
+  int64_t probe_rotate_count_;
 };
 
 class ObDASIvfScanIter : public ObDASIvfBaseScanIter

@@ -95,6 +95,32 @@ ObIvfCidClusterKVCache &get_ivf_cid_cluster_kv_cache();
 int ivf_cid_flat_encode_entry(const ObIvfCidClusterEntry &entry, char *&out_buf, int64_t &out_len);
 void ivf_cid_flat_free_buf(char *buf);
 
+/// Incremental FILL builder: append rows into one data buffer; finalize does header + one data memcpy.
+struct ObIvfCidFlatFillState
+{
+  ObIvfCidFlatFillState();
+  char *data_buf_;
+  int64_t data_cap_;
+  int64_t data_len_;
+  common::ObSEArray<int64_t, 64> payload_off_;
+  common::ObSEArray<int32_t, 64> payload_len_;
+  common::ObSEArray<int64_t, 64> rk_off_;
+  common::ObSEArray<int32_t, 64> rk_len_;
+};
+
+int ivf_cid_flat_fill_create(ObIvfCidFlatFillState *&out_state);
+void ivf_cid_flat_fill_destroy(ObIvfCidFlatFillState *state);
+int ivf_cid_flat_fill_append_row(ObIvfCidFlatFillState *state,
+    const ObIvfCidClusterPayloadType payload_type,
+    const char *payload,
+    const int32_t payload_len,
+    const common::ObRowkey &rowkey);
+int ivf_cid_flat_fill_finalize(const ObIvfCidClusterEntry &entry,
+    const ObIvfCidFlatFillState *state,
+    char *&out_buf,
+    int64_t &out_len);
+bool ivf_cid_flat_fill_probe_first_payload_l2_unit(const ObIvfCidFlatFillState *state, bool &is_unit);
+
 /// Probe first FLAT_FLOAT payload (same ||v||^2 threshold as ObVectorNormalize::L2_normalize_vector).
 bool ivf_cid_probe_payloads_l2_unit(const ObIvfCidClusterEntry &entry, bool &is_unit, bool &known);
 

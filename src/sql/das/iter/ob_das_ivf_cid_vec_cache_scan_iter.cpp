@@ -262,9 +262,7 @@ void ObDASIvfCidVecCacheScanIter::maybe_log_progress_stats(uint64_t cid) const
              K(session_stats_.storage_only_cid_cnt_),
              K(session_stats_.replay_cid_cnt_),
              K(session_stats_.fill_cid_cnt_),
-             K(session_stats_.storage_fetch_us_),
-             K(session_stats_.fill_wait_us_),
-             K(session_stats_.fill_wait_cnt_));
+             K(session_stats_.storage_fetch_us_));
   }
 }
 
@@ -370,7 +368,6 @@ int ObDASIvfCidVecCacheScanIter::flush_building_cluster()
     } else {
       session_stats_.put_cid_ok_cnt_++;
       session_stats_.put_rows_total_ += rows;
-      cluster_cache_->notify_refresh_put_done(fill_cid);
       discard_building_cluster();
     }
   }
@@ -426,6 +423,11 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
         cid_fill_leader_ = false;
       } else {
         building_cluster_.arena_ = new (buf) ObArenaAllocator(ObMemAttr(MTL_ID(), "IvfCidClu"));
+        if (OB_FAIL(share::ivf_cid_flat_fill_create(building_cluster_.flat_fill_))) {
+          LOG_WARN("failed to create flat fill builder", K(ret), K(new_cid));
+          cluster_cache_->finish_cid_fill(new_cid);
+          cid_fill_leader_ = false;
+        }
       }
     } else {
       ret = OB_ERR_UNEXPECTED;
@@ -526,14 +528,13 @@ int ObDASIvfCidVecCacheScanIter::materialize_row_to_eval(const share::ObIvfCidCl
 int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(cid_vec_ctdef_) || OB_ISNULL(eval_ctx_) || OB_ISNULL(building_cluster_.arena_)) {
+  if (OB_ISNULL(cid_vec_ctdef_) || OB_ISNULL(eval_ctx_) || OB_ISNULL(building_cluster_.arena_)
+      || OB_ISNULL(building_cluster_.flat_fill_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
     guard.set_batch_idx(batch_idx);
     const ExprFixedArray &out = cid_vec_ctdef_->result_output_;
-    share::ObIvfCidClusterRow row;
-    row.payload_type_ = payload_type();
     ObExpr *payload_expr = out.at(1);
     ObString payload = payload_expr->locate_expr_datum(*eval_ctx_).get_string();
     if (OB_FAIL(ObTextStringHelper::read_real_string_data(
@@ -544,20 +545,9 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
             payload))) {
       LOG_WARN("failed to read real string data", K(ret));
     }
-    char *payload_buf = nullptr;
     ObObj *obj_buf = nullptr;
-    int64_t rowkey_cnt = out.count() - 2;
-    if (OB_FAIL(ret)) {
-    } else if (payload.length() > 0
-               && OB_ISNULL(payload_buf = static_cast<char *>(building_cluster_.arena_->alloc(payload.length())))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else if (payload.length() > 0) {
-      MEMCPY(payload_buf, payload.ptr(), payload.length());
-      row.payload_ = payload_buf;
-      row.payload_len_ = payload.length();
-      ObDatum &payload_datum = payload_expr->locate_datum_for_write(*eval_ctx_);
-      payload_datum.set_string(row.payload_, row.payload_len_);
-    }
+    const int64_t rowkey_cnt = out.count() - 2;
+    common::ObRowkey rowkey;
     if (OB_FAIL(ret)) {
     } else if (rowkey_cnt > 0
                && OB_ISNULL(obj_buf = static_cast<ObObj *>(building_cluster_.arena_->alloc(sizeof(ObObj) * rowkey_cnt)))) {
@@ -570,17 +560,24 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
         }
       }
       if (OB_SUCC(ret)) {
-        row.rowkey_.assign(obj_buf, rk);
-        if (OB_FAIL(building_cluster_.rows_.push_back(row))) {
-          LOG_WARN("failed to push row", K(ret));
+        rowkey.assign(obj_buf, rk);
+        if (OB_FAIL(share::ivf_cid_flat_fill_append_row(
+                building_cluster_.flat_fill_,
+                payload_type(),
+                payload.length() > 0 ? payload.ptr() : nullptr,
+                static_cast<int32_t>(payload.length()),
+                rowkey))) {
+          LOG_WARN("failed to append flat fill row", K(ret));
         } else {
+          ObDatum &payload_datum = payload_expr->locate_datum_for_write(*eval_ctx_);
+          payload_datum.set_string(payload.ptr(), payload.length());
           building_cluster_.row_count_++;
-          building_cluster_.entry_bytes_ += row.payload_len_ + ob_ivf_cid_rowkey_storage_bytes(obj_buf, rk);
+          building_cluster_.entry_bytes_ += payload.length()
+              + ob_ivf_cid_rowkey_storage_bytes(obj_buf, rk);
           session_stats_.fill_row_cnt_++;
           if (building_cluster_.row_count_ == 1 && !building_cluster_.payloads_l2_unit_known_) {
             bool is_unit = false;
-            bool probe_known = false;
-            if (share::ivf_cid_probe_payloads_l2_unit(building_cluster_, is_unit, probe_known) && probe_known) {
+            if (share::ivf_cid_flat_fill_probe_first_payload_l2_unit(building_cluster_.flat_fill_, is_unit)) {
               building_cluster_.payloads_l2_unit_known_ = true;
               building_cluster_.payloads_l2_unit_ = is_unit;
             }

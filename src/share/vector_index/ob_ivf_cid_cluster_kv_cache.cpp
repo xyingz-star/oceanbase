@@ -140,6 +140,191 @@ bool ivf_cid_probe_payloads_l2_unit(const ObIvfCidClusterEntry &entry, bool &is_
   return known;
 }
 
+static const int64_t IVF_CID_FLAT_FILL_INITIAL_DATA_CAP = 64 * 1024;
+
+ObIvfCidFlatFillState::ObIvfCidFlatFillState()
+  : data_buf_(nullptr), data_cap_(0), data_len_(0), payload_off_(), payload_len_(), rk_off_(), rk_len_()
+{}
+
+static int ivf_cid_flat_fill_ensure_cap_(ObIvfCidFlatFillState *state, const int64_t need_bytes)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(state)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (state->data_len_ + need_bytes <= state->data_cap_) {
+  } else {
+    int64_t new_cap = state->data_cap_ > 0 ? state->data_cap_ : IVF_CID_FLAT_FILL_INITIAL_DATA_CAP;
+    while (new_cap < state->data_len_ + need_bytes) {
+      new_cap *= 2;
+    }
+    char *new_buf = static_cast<char *>(ob_malloc(new_cap, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidFlat")));
+    if (OB_ISNULL(new_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      if (state->data_len_ > 0) {
+        MEMCPY(new_buf, state->data_buf_, state->data_len_);
+      }
+      if (OB_NOT_NULL(state->data_buf_)) {
+        ob_free(state->data_buf_);
+      }
+      state->data_buf_ = new_buf;
+      state->data_cap_ = new_cap;
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_fill_create(ObIvfCidFlatFillState *&out_state)
+{
+  int ret = OB_SUCCESS;
+  out_state = nullptr;
+  ObIvfCidFlatFillState *state = OB_NEW(ObIvfCidFlatFillState, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidFill"));
+  if (OB_ISNULL(state)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(ivf_cid_flat_fill_ensure_cap_(state, IVF_CID_FLAT_FILL_INITIAL_DATA_CAP))) {
+    LOG_WARN("failed to init flat fill data buffer", K(ret));
+    OB_DELETE(ObIvfCidFlatFillState, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidFill"), state);
+  } else {
+    out_state = state;
+  }
+  return ret;
+}
+
+void ivf_cid_flat_fill_destroy(ObIvfCidFlatFillState *state)
+{
+  if (OB_ISNULL(state)) {
+  } else {
+    if (OB_NOT_NULL(state->data_buf_)) {
+      ob_free(state->data_buf_);
+      state->data_buf_ = nullptr;
+    }
+    OB_DELETE(ObIvfCidFlatFillState, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidFill"), state);
+  }
+}
+
+bool ivf_cid_flat_fill_probe_first_payload_l2_unit(const ObIvfCidFlatFillState *state, bool &is_unit)
+{
+  is_unit = false;
+  if (OB_ISNULL(state) || state->payload_off_.count() <= 0 || state->payload_len_.count() <= 0) {
+    return false;
+  }
+  const int32_t payload_len = state->payload_len_.at(0);
+  const int64_t payload_off = state->payload_off_.at(0);
+  if (payload_len <= 0 || payload_off < 0 || payload_off + payload_len > state->data_len_) {
+    return false;
+  }
+  if (payload_len % static_cast<int32_t>(sizeof(float)) != 0) {
+    return false;
+  }
+  const int64_t dim = payload_len / static_cast<int64_t>(sizeof(float));
+  const float norm_l2_sqr = ObVectorL2Distance<float>::l2_norm_square(
+      reinterpret_cast<const float *>(state->data_buf_ + payload_off), dim);
+  is_unit = norm_l2_sqr > 0 && fabsf(1.0f - norm_l2_sqr) <= IVF_CID_L2_UNIT_ACCURACY;
+  return true;
+}
+
+int ivf_cid_flat_fill_append_row(ObIvfCidFlatFillState *state,
+    const ObIvfCidClusterPayloadType payload_type,
+    const char *payload,
+    const int32_t payload_len,
+    const common::ObRowkey &rowkey)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(state) || payload_type != IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t rk_sz = ObTableSerialUtil::get_serialize_size(rowkey);
+    if (OB_FAIL(ivf_cid_flat_fill_ensure_cap_(state, payload_len + rk_sz))) {
+      LOG_WARN("failed to grow flat fill buffer", K(ret), K(payload_len), K(rk_sz));
+    } else {
+      const int64_t payload_off = state->data_len_;
+      if (payload_len > 0) {
+        if (OB_ISNULL(payload)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          MEMCPY(state->data_buf_ + payload_off, payload, payload_len);
+          state->data_len_ += payload_len;
+        }
+      }
+      int64_t rk_off = state->data_len_;
+      int64_t pos = rk_off;
+      if (OB_SUCC(ret) && rk_sz > 0) {
+        if (OB_FAIL(ObTableSerialUtil::serialize(state->data_buf_, state->data_cap_, pos, rowkey))) {
+          LOG_WARN("failed to serialize rowkey into flat fill buffer", K(ret));
+        } else {
+          state->data_len_ = pos;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(state->payload_off_.push_back(payload_off))) {
+        } else if (OB_FAIL(state->payload_len_.push_back(payload_len))) {
+        } else if (OB_FAIL(state->rk_off_.push_back(rk_off))) {
+        } else if (OB_FAIL(state->rk_len_.push_back(static_cast<int32_t>(rk_sz)))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_fill_finalize(const ObIvfCidClusterEntry &entry,
+    const ObIvfCidFlatFillState *state,
+    char *&out_buf,
+    int64_t &out_len)
+{
+  int ret = OB_SUCCESS;
+  out_buf = nullptr;
+  out_len = 0;
+  const int64_t row_count = OB_NOT_NULL(state) ? state->payload_off_.count() : 0;
+  if (row_count <= 0 || OB_ISNULL(state)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t total = align8(ivf_cid_flat_header_and_tables_size(row_count) + state->data_len_);
+    char *buf = static_cast<char *>(ob_malloc(total, ObMemAttr(OB_SERVER_TENANT_ID, "IvfCidFlat")));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMSET(buf, 0, total);
+      ObIvfCidFlatHeader *hdr = reinterpret_cast<ObIvfCidFlatHeader *>(buf);
+      hdr->magic_ = ObIvfCidFlatHeader::MAGIC;
+      hdr->version_ = ObIvfCidFlatHeader::VERSION;
+      hdr->index_epoch_ = entry.index_epoch_;
+      hdr->cid_ = entry.cid_;
+      hdr->row_count_ = row_count;
+      hdr->entry_bytes_ = entry.entry_bytes_;
+      hdr->access_cnt_ = entry.heat_.access_cnt_;
+      hdr->replay_cnt_ = entry.heat_.replay_cnt_;
+      hdr->fill_cnt_ = entry.heat_.fill_cnt_;
+      hdr->last_access_us_ = entry.heat_.last_access_us_;
+      hdr->flat_buf_len_ = total;
+      hdr->payload_type_ = static_cast<uint8_t>(IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT);
+      hdr->reserved_[0] = entry.payloads_l2_unit_known_ ? 1 : 0;
+      hdr->reserved_[1] = (entry.payloads_l2_unit_known_ && entry.payloads_l2_unit_) ? 1 : 0;
+      char *payload_off_tbl = buf + sizeof(ObIvfCidFlatHeader);
+      char *payload_len_tbl = payload_off_tbl + row_count * sizeof(int64_t);
+      char *rowkey_off_tbl = payload_len_tbl + row_count * sizeof(int32_t);
+      char *rowkey_len_tbl = rowkey_off_tbl + row_count * sizeof(int64_t);
+      const int64_t data_pos = align8(ivf_cid_flat_header_and_tables_size(row_count));
+      if (state->data_len_ > 0) {
+        MEMCPY(buf + data_pos, state->data_buf_, state->data_len_);
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < row_count; ++i) {
+        reinterpret_cast<int64_t *>(payload_off_tbl)[i] = data_pos + state->payload_off_.at(i);
+        reinterpret_cast<int32_t *>(payload_len_tbl)[i] = state->payload_len_.at(i);
+        reinterpret_cast<int64_t *>(rowkey_off_tbl)[i] = data_pos + state->rk_off_.at(i);
+        reinterpret_cast<int32_t *>(rowkey_len_tbl)[i] = state->rk_len_.at(i);
+      }
+      if (OB_SUCC(ret)) {
+        out_buf = buf;
+        out_len = total;
+      } else {
+        ob_free(buf);
+      }
+    }
+  }
+  return ret;
+}
+
 int ivf_cid_flat_encode_entry(const ObIvfCidClusterEntry &entry, char *&out_buf, int64_t &out_len)
 {
   int ret = OB_SUCCESS;
