@@ -18,8 +18,17 @@
 #include "lib/lock/ob_mutex.h"
 #include "share/ob_define.h"
 #include "common/ob_tablet_id.h"
+#include "share/cache/ob_kvcache_struct.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include <cstdio>
+
+namespace oceanbase
+{
+namespace common
+{
+class ObKVCacheHandle;
+}
+}
 
 namespace oceanbase
 {
@@ -78,6 +87,24 @@ struct ObIvfCidClusterRow
 struct ObIvfCidClusterEntry;
 struct ObIvfCidFillGate;
 struct ObIvfCidClusterCacheSessionStats;
+struct IvfPinFreeFn;
+struct IvfPinInvalidateFn;
+
+/// Cache visibility phase (stored in atomic cache_phase_).
+enum class ObIvfCidClusterCachePhase : uint8_t
+{
+  LEARNING = 0,
+  REFRESHING = 1,
+  SERVING = 2,
+};
+
+/// Per-CID lookup outcome exposed to DAS: hit (REPLAY), miss (storage), or fill leader (REFRESHING only).
+enum class ObIvfCidClusterLookupResult : int8_t
+{
+  HIT = 0,
+  MISS = 1,
+  FILL_LEADER = 2,
+};
 
 /// Cumulative stats on one ObIvfCidClusterCache instance (cross-query, thread-safe).
 struct ObIvfCidClusterCacheStats
@@ -96,45 +123,50 @@ struct ObIvfCidClusterCacheStats
   int64_t evict_entry_cnt_;
   int64_t evict_bytes_;
   int64_t invalidate_cnt_;
+  int64_t phase_learning_cnt_;
+  int64_t phase_refreshing_cnt_;
+  int64_t phase_serving_cnt_;
   /// Maintained with ATOMIC_INC/DEC on put/erase; read via get_stats() without lock_.
   int64_t cur_entry_cnt_;
   int64_t cur_bytes_;
 };
 
+struct ObIvfCidClusterLedgerRecord
+{
+  ObIvfCidClusterLedgerRecord() : bytes_(0), heat_() {}
+  int64_t bytes_;
+  ObIvfCidClusterHeat heat_;
+};
+
 class ObIvfCidClusterCache
 {
   friend void release_ivf_cid_cluster_cache(ObIvfCidClusterCache *cache);
+  friend struct IvfPinFreeFn;
+  friend struct IvfPinInvalidateFn;
 
 public:
-  struct EntryMapKey
-  {
-    EntryMapKey() : cid_(0) {}
-    explicit EntryMapKey(uint64_t cid) : cid_(cid) {}
-    uint64_t cid_;
-    uint64_t hash() const { return cid_; }
-    int hash(uint64_t &hash_val) const { hash_val = hash(); return OB_SUCCESS; }
-    bool operator==(const EntryMapKey &o) const { return cid_ == o.cid_; }
-  };
-
   ObIvfCidClusterCache();
   ~ObIvfCidClusterCache();
   int init(const ObIvfCidClusterCacheMgrKey &key, int64_t max_bytes, int64_t max_rows_per_cid, int64_t replay_heat_weight);
   void destroy();
   /// Bump index epoch and drop all cluster entries (call after IVF index rebuild).
   void invalidate_all();
-  uint64_t get_index_epoch() const { return current_index_epoch_; }
+  uint64_t get_index_epoch() const { return load_index_epoch_(); }
   int64_t get_max_bytes() const { return max_bytes_; }
-  /// Hit: pins entry. Miss: STORAGE_ONLY by default; FILL leader only if probe access >= min threshold,
-  /// cid ranks in global probe top-K, and (cache has room or hotter than coldest evictable entry).
-  int acquire_cid_cluster(uint64_t cid,
+  ObIvfCidClusterCachePhase get_cache_phase() const { return load_phase_(); }
+  bool is_cache_serving() const { return load_phase_() == ObIvfCidClusterCachePhase::SERVING; }
+  /// Query entry: LEARNING/REFRESHING => MISS or FILL_LEADER; SERVING => readonly HIT/MISS.
+  int lookup_cid(uint64_t cid,
       ObIvfCidClusterEntry *&entry,
-      bool &is_fill_leader,
-      bool &storage_only,
+      ObIvfCidClusterLookupResult &result,
       ObIvfCidClusterCacheSessionStats *session_stats = nullptr);
+  /// After FILL put during REFRESHING; may transition to SERVING when targets are loaded.
+  void notify_refresh_put_done(uint64_t cid);
   /// Leader calls after FILL put (or on error) to wake waiters for this cid.
   void finish_cid_fill(uint64_t cid);
   int put(ObIvfCidClusterEntry &entry);
-  int unpin_entry(ObIvfCidClusterEntry *entry);
+  /// Release REPLAY view (session-owned or borrowed readonly slot).
+  void release_session_entry(ObIvfCidClusterEntry *entry);
   void inc_ref();
   void dec_ref();
   int64_t get_ref() const { return ref_cnt_; }
@@ -142,51 +174,138 @@ public:
   void log_stats(const char *tag) const;
 
 private:
-  int try_pin_ready_entry_(uint64_t cid, ObIvfCidClusterEntry *&entry);
+  struct ObIvfCidClusterPinSlot
+  {
+    ObIvfCidClusterPinSlot() : view_entry_(nullptr), rowkey_objs_(nullptr) {}
+    ObIvfCidClusterEntry *view_entry_;
+    common::ObObj *rowkey_objs_;
+    common::ObKVCacheHandle kv_handle_;
+  };
+  struct ObIvfKvPinPrep
+  {
+    ObIvfKvPinPrep()
+      : flat_buf_(nullptr),
+        flat_len_(0),
+        view_entry_(nullptr),
+        rowkey_objs_(nullptr),
+        rowkey_obj_cnt_(0)
+    {}
+    const char *flat_buf_;
+    int64_t flat_len_;
+    ObIvfCidClusterEntry *view_entry_;
+    common::ObObj *rowkey_objs_;
+    int64_t rowkey_obj_cnt_;
+    common::ObKVCacheHandle kv_handle_;
+  };
+  int load_kv_pin_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvPinPrep &prep);
+  void discard_kv_pin_prep_(ObIvfKvPinPrep &prep);
+  void reconcile_kv_pin_miss_locked_(uint64_t cid);
+  void release_pin_slot_(ObIvfCidClusterPinSlot *slot);
+  int ledger_remove_locked_(uint64_t cid, bool count_evict, bool erase_kv = true);
+  int ledger_put_locked_(uint64_t cid, int64_t bytes, const ObIvfCidClusterHeat &heat);
   void bump_probe_heat_locked_(uint64_t cid);
-  double calc_probe_heat_score_(const ObIvfCidClusterHeat &heat) const;
-  double calc_prospective_heat_score_(uint64_t cid) const;
-  /// Among probe-qualified cids, true if fewer than top-K have strictly higher heat than target.
-  bool is_probe_top_k_for_fill_locked_(uint64_t cid, double target_score) const;
-  /// Returns true if this miss may become FILL leader (after bumping probe heat).
-  bool should_admit_fill_locked_(uint64_t cid);
+  double heat_score_(const ObIvfCidClusterHeat &heat, int64_t byte_denom) const;
+  double prospective_heat_score_locked_(uint64_t cid) const;
+  bool hotter_than_coldest_locked_(uint64_t skip_cid, double incoming_score) const;
+  void release_dormant_pin_shard_locked_(uint64_t cid, ObIvfCidClusterPinSlot *slot);
   void clear_probe_heat_locked_(uint64_t cid);
-  int evict_until(int64_t need_bytes);
-  double calc_heat_score(const ObIvfCidClusterEntry &e) const;
-  int erase_entry(const EntryMapKey &key, bool count_evict);
+  bool find_coldest_evictable_ledger_locked_(uint64_t skip_cid, double &min_score, uint64_t &victim_cid) const;
+  int ledger_evict_until_locked_(uint64_t skip_cid, int64_t need_bytes);
+  int ensure_ledger_room_locked_(uint64_t skip_cid, int64_t need_bytes, double incoming_score);
+  int install_pin_slot_locked_(uint64_t cid,
+      ObIvfCidClusterEntry *view_entry,
+      common::ObObj *rowkey_objs,
+      common::ObKVCacheHandle &kv_handle);
+  int warm_pin_slot_(uint64_t cid);
   void clear_all_fill_gates_();
+  static const int64_t IVF_CID_PIN_MAP_SHARD_CNT = 64;
+  int64_t pin_shard_idx_(uint64_t cid) const;
+  common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> &pin_map_shard_(uint64_t cid);
+  const common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> &pin_map_shard_(uint64_t cid) const;
+  lib::ObMutex &pin_shard_lock_(uint64_t cid);
+  const lib::ObMutex &pin_shard_lock_(uint64_t cid) const;
+  int ledger_remove_(uint64_t cid, bool count_evict, bool erase_kv = true);
+  int lookup_cid_refreshing_(uint64_t cid,
+      ObIvfCidClusterEntry *&entry,
+      ObIvfCidClusterLookupResult &result,
+      ObIvfCidClusterCacheSessionStats *session_stats);
+  int lookup_readonly_serving_(uint64_t cid, ObIvfCidClusterEntry *&entry);
+  void record_access_(uint64_t cid, ObIvfCidClusterCachePhase phase);
+  void try_begin_refresh_from_learning_();
+  void try_begin_refresh_from_serving_();
+  bool cas_phase_(ObIvfCidClusterCachePhase expected, ObIvfCidClusterCachePhase desired);
+  void store_phase_(ObIvfCidClusterCachePhase phase);
+  ObIvfCidClusterCachePhase load_phase_() const;
+  int64_t learning_start_threshold_() const;
+  void prepare_refresh_targets_(bool use_ledger_heat = false);
+  void finalize_refresh_to_serving_();
+  int warm_readonly_pin_slots_();
+  uint64_t load_index_epoch_() const;
+  void try_finalize_refresh_if_complete_();
+  bool is_refresh_target_cid_(uint64_t cid) const;
+  void mark_refresh_target_done_(uint64_t cid);
   bool inited_;
   ObIvfCidClusterCacheMgrKey mgr_key_;
   uint64_t current_index_epoch_;
   int64_t max_bytes_;
   int64_t max_rows_per_cid_;
   int64_t replay_heat_weight_;
-  int64_t total_bytes_;
+  int64_t ledger_bytes_;
   int64_t ref_cnt_;
+  int64_t cache_phase_;
+  int64_t total_access_samples_;
+  int64_t serving_miss_samples_;
+  int64_t refresh_targets_remaining_;
+  common::hash::ObHashMap<uint64_t, int8_t> refresh_target_map_;
   ObIvfCidClusterCacheStats stats_;
-  common::hash::ObHashMap<EntryMapKey, ObIvfCidClusterEntry *> entry_map_;
+  common::hash::ObHashMap<uint64_t, ObIvfCidClusterPinSlot *> pin_map_shards_[IVF_CID_PIN_MAP_SHARD_CNT];
+  lib::ObMutex *pin_shard_locks_[IVF_CID_PIN_MAP_SHARD_CNT];
+  common::hash::ObHashMap<uint64_t, ObIvfCidClusterLedgerRecord> ledger_map_;
   common::hash::ObHashMap<uint64_t, ObIvfCidFillGate *> fill_gates_;
-  /// Access heat for cids not yet in entry_map_ (used for fill vs storage-only bypass).
   common::hash::ObHashMap<uint64_t, ObIvfCidClusterHeat> probe_heat_map_;
-  mutable lib::ObMutex lock_;
+  mutable lib::ObMutex ledger_lock_;
+  mutable lib::ObMutex probe_heat_lock_;
   mutable lib::ObMutex fill_gates_lock_;
 };
 
 struct ObIvfCidClusterEntry
 {
   ObIvfCidClusterEntry()
-    : index_epoch_(0), cid_(0), row_count_(0), entry_bytes_(0), pin_cnt_(0), heat_(), rows_(), arena_(nullptr) {}
+    : index_epoch_(0),
+      cid_(0),
+      row_count_(0),
+      entry_bytes_(0),
+      heat_(),
+      rows_(),
+      arena_(nullptr),
+      kv_flat_buf_(nullptr),
+      rowkey_objs_(nullptr),
+      payloads_l2_unit_known_(false),
+      payloads_l2_unit_(false),
+      session_owned_(false),
+      session_borrowed_(false),
+      session_kv_handle_()
+  {}
   ~ObIvfCidClusterEntry();
-  /// Index generation when this cluster snapshot was cached; must match cache current_index_epoch_.
+  bool is_kv_view() const { return OB_ISNULL(arena_) && OB_NOT_NULL(kv_flat_buf_); }
   uint64_t index_epoch_;
   uint64_t cid_;
   int64_t row_count_;
   int64_t entry_bytes_;
-  /// REPLAY in progress; evict skips while pin_cnt_ > 0.
-  int64_t pin_cnt_;
   ObIvfCidClusterHeat heat_;
   common::ObArray<ObIvfCidClusterRow> rows_;
   common::ObArenaAllocator *arena_;
+  /// REPLAY view: payload pointers into this KV flat buffer.
+  const char *kv_flat_buf_;
+  common::ObObj *rowkey_objs_;
+  /// FILL-time probe (stored in flat header): skip per-query first-row L2 probe on REPLAY when known.
+  bool payloads_l2_unit_known_;
+  bool payloads_l2_unit_;
+  /// SERVING readonly: query owns KV handle + entry shell.
+  bool session_owned_;
+  /// SERVING readonly: borrows immutable pin_map view (no unpin).
+  bool session_borrowed_;
+  common::ObKVCacheHandle session_kv_handle_;
 };
 
 /// Per-query stats on ObDASIvfCidVecCacheScanIter (printed in inner_release when enabled).
@@ -204,7 +323,7 @@ struct ObIvfCidClusterCacheSessionStats
   int64_t storage_only_cid_cnt_;
   /// Total cid switches (on_cid_switch); includes storage_only + replay + fill.
   int64_t cid_switch_cnt_;
-  /// Time in acquire_cid_cluster (us).
+  /// Time in lookup_cid (us).
   int64_t acquire_us_;
   /// Time blocked on fill gate (us) and number of cond waits.
   int64_t fill_wait_us_;
@@ -238,6 +357,7 @@ void release_ivf_cid_cluster_cache(ObIvfCidClusterCache *cache);
 void invalidate_ivf_cid_cluster_cache_for_index_tablet(uint64_t tenant_id, const common::ObTabletID &index_tablet_id);
 bool is_ivf_cid_cluster_cache_enabled();
 bool is_ivf_cid_cluster_cache_stats_enabled();
+int64_t ivf_cid_cluster_cache_fill_min_probe_access();
 /// When STATS=1: default 1 (progress every cid + final). EVERY_N_CID=0 or STATS_LIVE=0 disables progress.
 int64_t ivf_cid_cluster_cache_stats_every_n_cid();
 void log_ivf_cid_cluster_cache_session_stats(

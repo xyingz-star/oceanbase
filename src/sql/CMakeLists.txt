@@ -101,6 +101,7 @@ ob_set_subtarget(ob_sql das
   das/iter/ob_das_mvi_lookup_iter.cpp
   das/iter/ob_das_spatial_scan_iter.cpp
   das/iter/ob_das_hnsw_scan_iter.cpp
+  das/iter/ob_das_ivf_per_query_stats.cpp
   das/iter/ob_das_ivf_scan_iter.cpp
   das/iter/ob_das_ivf_cid_vec_cache_scan_iter.cpp
   das/iter/ob_das_spiv_merge_iter.cpp

@@ -49,13 +49,13 @@ SWEEP_NMBKM_DIV_FILE="${SWEEP_NMBKM_DIV_FILE:-/tmp/ob_nmbkm_min_n_scale}"
 # 1=每轮 bench 前删除 div 文件，避免 NMBKM 配置残留
 SWEEP_CLEAR_NMBKM_DIV_FILE="${SWEEP_CLEAR_NMBKM_DIV_FILE:-1}"
 SWEEP_SKIP_DIRS="${SWEEP_SKIP_DIRS:-768D10M}"
-export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-8}"
+export VDB_NUM_CONCURRENCY="${VDB_NUM_CONCURRENCY:-80}"
 SWEEP_AUTO_OB_STAGES="${SWEEP_AUTO_OB_STAGES:-1}"
 # IVF cid cluster cache stats (observer reads env; default on in code, explicit here for sweep logs)
 export OB_IVF_CID_CLUSTER_CACHE_STATS="${OB_IVF_CID_CLUSTER_CACHE_STATS:-1}"
 export OB_IVF_CID_CLUSTER_CACHE_LOG_DIR="${OB_IVF_CID_CLUSTER_CACHE_LOG_DIR:-${HOME}/log}"
-# Per-cid progress on by default (matches observer). Set EVERY_N_CID=0 or STATS_LIVE=0 to reduce log I/O.
-export OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID="${OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID:-1}"
+# Per-query cache final on owner thread only; per-CID progress opt-in (EVERY_N_CID>0, or STATS_LIVE=1).
+export OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID="${OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID:-0}"
 
 # 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认仅一组 1536D50K。
 SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K}"

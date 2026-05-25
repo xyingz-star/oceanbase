@@ -13,6 +13,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "share/vector_index/ob_ivf_cid_cluster_cache.h"
+#include "share/vector_index/ob_ivf_cid_cluster_kv_cache.h"
 #include "lib/container/ob_array.h"
 #include "lib/allocator/ob_malloc.h"
 #include "lib/atomic/ob_atomic.h"
@@ -84,6 +85,12 @@ ObIvfCidClusterEntry::~ObIvfCidClusterEntry()
     ob_free(arena_);
     arena_ = nullptr;
   }
+  if (session_owned_ && OB_NOT_NULL(rowkey_objs_)) {
+    ob_free(rowkey_objs_);
+    rowkey_objs_ = nullptr;
+  }
+  session_kv_handle_.reset();
+  kv_flat_buf_ = nullptr;
 }
 
 bool is_ivf_cid_cluster_cache_enabled()
@@ -122,8 +129,8 @@ int64_t ivf_cid_cluster_cache_stats_every_n_cid()
   if (live != nullptr && (live[0] == '1' || live[0] == 'y' || live[0] == 'Y' || live[0] == 't' || live[0] == 'T')) {
     return 1;
   }
-  // Default with STATS=1: progress every cid + session/final on query end.
-  return 1;
+  // Default with STATS=1: per-query final on owner thread only; no per-CID progress spam.
+  return 0;
 }
 
 void ObIvfCidClusterCacheStats::reset()
@@ -141,6 +148,9 @@ void ObIvfCidClusterCacheStats::reset()
   evict_entry_cnt_ = 0;
   evict_bytes_ = 0;
   invalidate_cnt_ = 0;
+  phase_learning_cnt_ = 0;
+  phase_refreshing_cnt_ = 0;
+  phase_serving_cnt_ = 0;
   cur_entry_cnt_ = 0;
   cur_bytes_ = 0;
 }
@@ -543,8 +553,6 @@ static int ensure_cache_mgr_map_inited()
   return ret;
 }
 
-typedef common::hash::HashMapPair<ObIvfCidClusterCache::EntryMapKey, ObIvfCidClusterEntry *> CidClusterEntryPair;
-
 struct ObIvfCidFillGate
 {
   explicit ObIvfCidFillGate(uint64_t cid) : cid_(cid), filling_(false), ref_cnt_(1), cond_() {}
@@ -579,40 +587,39 @@ struct FillGateWakeAndFreeFn
   }
 };
 
-struct EvictVictimPicker
+struct IvfPinFreeFn
 {
-  explicit EvictVictimPicker(int64_t replay_heat_weight)
-    : replay_heat_weight_(replay_heat_weight),
-      min_score_(DBL_MAX),
-      oldest_access_(INT64_MAX),
-      victim_key_(),
-      victim_(nullptr)
-  {}
-  int operator()(const CidClusterEntryPair &entry)
+  explicit IvfPinFreeFn(ObIvfCidClusterCache &cache) : cache_(cache) {}
+  int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *> &pair)
   {
-    int ret = OB_SUCCESS;
-    ObIvfCidClusterEntry *e = entry.second;
-    if (OB_ISNULL(e) || e->pin_cnt_ > 0) {
-    } else {
-      const int64_t denom = OB_MAX(e->entry_bytes_, IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
-      const double score =
-          static_cast<double>(e->heat_.access_cnt_ + replay_heat_weight_ * e->heat_.replay_cnt_)
-          / static_cast<double>(denom);
-      if (score < min_score_ || (score == min_score_ && e->heat_.last_access_us_ < oldest_access_)) {
-        min_score_ = score;
-        oldest_access_ = e->heat_.last_access_us_;
-        victim_key_ = entry.first;
-        victim_ = e;
-      }
-    }
-    return ret;
+    cache_.release_pin_slot_(pair.second);
+    return OB_SUCCESS;
   }
-  int64_t replay_heat_weight_;
-  double min_score_;
-  int64_t oldest_access_;
-  ObIvfCidClusterCache::EntryMapKey victim_key_;
-  ObIvfCidClusterEntry *victim_;
+  ObIvfCidClusterCache &cache_;
 };
+
+/// Online invalidate: keep slots with active REPLAY pins; cleanup on unpin.
+struct IvfPinInvalidateFn
+{
+  IvfPinInvalidateFn(common::hash::ObHashMap<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *> &pin_map,
+      ObIvfCidClusterCache &cache)
+      : pin_map_(pin_map), cache_(cache)
+  {}
+  int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *> &pair)
+  {
+    ObIvfCidClusterCache::ObIvfCidClusterPinSlot *slot = pair.second;
+    if (OB_NOT_NULL(slot)) {
+      (void)pin_map_.erase_refactored(pair.first);
+      cache_.release_pin_slot_(slot);
+    }
+    return OB_SUCCESS;
+  }
+  common::hash::ObHashMap<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *> &pin_map_;
+  ObIvfCidClusterCache &cache_;
+};
+
+static const int64_t IVF_MAP_OVERWRITE = 1;
+typedef lib::ObMutex IvfPinShardMutex;
 
 ObIvfCidClusterCache::ObIvfCidClusterCache()
   : inited_(false),
@@ -621,13 +628,79 @@ ObIvfCidClusterCache::ObIvfCidClusterCache()
     max_bytes_(0),
     max_rows_per_cid_(0),
     replay_heat_weight_(DEFAULT_IVF_CID_CLUSTER_REPLAY_HEAT_WEIGHT),
-    total_bytes_(0),
+    ledger_bytes_(0),
     ref_cnt_(0),
-    entry_map_(),
+    cache_phase_(static_cast<int64_t>(ObIvfCidClusterCachePhase::LEARNING)),
+    total_access_samples_(0),
+    serving_miss_samples_(0),
+    refresh_targets_remaining_(0),
+    refresh_target_map_(),
+    ledger_map_(),
     fill_gates_(),
-    lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK),
+    ledger_lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK),
+    probe_heat_lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK),
     fill_gates_lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK)
-{}
+{
+  for (int64_t i = 0; i < IVF_CID_PIN_MAP_SHARD_CNT; ++i) {
+    pin_shard_locks_[i] = nullptr;
+  }
+  for (int64_t i = 0; i < IVF_CID_PIN_MAP_SHARD_CNT; ++i) {
+    pin_shard_locks_[i] = OB_NEW(IvfPinShardMutex, IVF_CID_CLUSTER_CACHE_LABEL, common::ObLatchIds::VECTOR_IVF_CACHE_LOCK);
+  }
+}
+
+int64_t ObIvfCidClusterCache::pin_shard_idx_(const uint64_t cid) const
+{
+  return static_cast<int64_t>(cid % static_cast<uint64_t>(IVF_CID_PIN_MAP_SHARD_CNT));
+}
+
+common::hash::ObHashMap<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *>
+    &ObIvfCidClusterCache::pin_map_shard_(const uint64_t cid)
+{
+  return pin_map_shards_[pin_shard_idx_(cid)];
+}
+
+const common::hash::ObHashMap<uint64_t, ObIvfCidClusterCache::ObIvfCidClusterPinSlot *>
+    &ObIvfCidClusterCache::pin_map_shard_(const uint64_t cid) const
+{
+  return pin_map_shards_[pin_shard_idx_(cid)];
+}
+
+lib::ObMutex &ObIvfCidClusterCache::pin_shard_lock_(const uint64_t cid)
+{
+  return *pin_shard_locks_[pin_shard_idx_(cid)];
+}
+
+const lib::ObMutex &ObIvfCidClusterCache::pin_shard_lock_(const uint64_t cid) const
+{
+  return *pin_shard_locks_[pin_shard_idx_(cid)];
+}
+
+uint64_t ObIvfCidClusterCache::load_index_epoch_() const
+{
+  return ATOMIC_LOAD(&current_index_epoch_);
+}
+
+void ObIvfCidClusterCache::release_dormant_pin_shard_locked_(const uint64_t cid, ObIvfCidClusterPinSlot *slot)
+{
+  if (OB_NOT_NULL(slot)) {
+    (void)pin_map_shard_(cid).erase_refactored(cid);
+    release_pin_slot_(slot);
+  }
+}
+
+int ObIvfCidClusterCache::ledger_remove_(const uint64_t cid, const bool count_evict, const bool erase_kv)
+{
+  {
+    lib::ObMutexGuard pin_guard(pin_shard_lock_(cid));
+    ObIvfCidClusterPinSlot *pin_slot = nullptr;
+    if (OB_SUCCESS == pin_map_shard_(cid).get_refactored(cid, pin_slot) && OB_NOT_NULL(pin_slot)) {
+      release_dormant_pin_shard_locked_(cid, pin_slot);
+    }
+  }
+  lib::ObMutexGuard ledger_guard(ledger_lock_);
+  return ledger_remove_locked_(cid, count_evict, erase_kv);
+}
 
 ObIvfCidClusterCache::~ObIvfCidClusterCache()
 {
@@ -642,21 +715,36 @@ int ObIvfCidClusterCache::init(const ObIvfCidClusterCacheMgrKey &key, int64_t ma
     ret = OB_INIT_TWICE;
   } else if (!key.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(entry_map_.create(128, attr, attr))) {
-    LOG_WARN("failed to create entry map", K(ret));
-  } else if (OB_FAIL(fill_gates_.create(64, attr, attr))) {
-    LOG_WARN("failed to create fill gates map", K(ret));
-  } else if (OB_FAIL(probe_heat_map_.create(128, attr, attr))) {
-    LOG_WARN("failed to create probe heat map", K(ret));
   } else {
-    mgr_key_ = key;
-    current_index_epoch_ = 1;
-    max_bytes_ = max_bytes > 0 ? max_bytes : DEFAULT_IVF_CID_CLUSTER_CACHE_MAX_MB * 1024L * 1024L;
-    max_rows_per_cid_ = max_rows_per_cid;
-    replay_heat_weight_ = replay_heat_weight > 0 ? replay_heat_weight : DEFAULT_IVF_CID_CLUSTER_REPLAY_HEAT_WEIGHT;
-    total_bytes_ = 0;
-    stats_.reset();
-    inited_ = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < IVF_CID_PIN_MAP_SHARD_CNT; ++i) {
+      if (OB_FAIL(pin_map_shards_[i].create(128, attr, attr))) {
+        LOG_WARN("failed to create pin map shard", K(ret), K(i));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ledger_map_.create(128, attr, attr))) {
+      LOG_WARN("failed to create ledger map", K(ret));
+    } else if (OB_FAIL(fill_gates_.create(64, attr, attr))) {
+      LOG_WARN("failed to create fill gates map", K(ret));
+    } else if (OB_FAIL(probe_heat_map_.create(128, attr, attr))) {
+      LOG_WARN("failed to create probe heat map", K(ret));
+    } else if (OB_FAIL(refresh_target_map_.create(128, attr, attr))) {
+      LOG_WARN("failed to create refresh target map", K(ret));
+    } else {
+      mgr_key_ = key;
+      current_index_epoch_ = 1;
+      cache_phase_ = static_cast<int64_t>(ObIvfCidClusterCachePhase::LEARNING);
+      total_access_samples_ = 0;
+      serving_miss_samples_ = 0;
+      refresh_targets_remaining_ = 0;
+      max_bytes_ = max_bytes > 0 ? max_bytes : DEFAULT_IVF_CID_CLUSTER_CACHE_MAX_MB * 1024L * 1024L;
+      max_rows_per_cid_ = max_rows_per_cid;
+      replay_heat_weight_ = replay_heat_weight > 0 ? replay_heat_weight : DEFAULT_IVF_CID_CLUSTER_REPLAY_HEAT_WEIGHT;
+      ledger_bytes_ = 0;
+      stats_.reset();
+      (void)get_ivf_cid_cluster_kv_cache().init_cache();
+      inited_ = true;
+    }
   }
   return ret;
 }
@@ -678,7 +766,10 @@ void ObIvfCidClusterCache::get_stats(ObIvfCidClusterCacheStats &out) const
   out.evict_bytes_ = ATOMIC_LOAD(&stats_.evict_bytes_);
   out.invalidate_cnt_ = ATOMIC_LOAD(&stats_.invalidate_cnt_);
   out.cur_entry_cnt_ = ATOMIC_LOAD(&stats_.cur_entry_cnt_);
-  out.cur_bytes_ = ATOMIC_LOAD(&total_bytes_);
+  {
+    lib::ObMutexGuard guard(ledger_lock_);
+    out.cur_bytes_ = ledger_bytes_;
+  }
 }
 
 void ObIvfCidClusterCache::log_stats(const char *tag) const
@@ -713,26 +804,51 @@ void ObIvfCidClusterCache::destroy()
 {
   clear_all_fill_gates_();
   (void)fill_gates_.destroy();
+  IvfPinFreeFn pin_free_fn(*this);
+  for (int64_t i = 0; i < IVF_CID_PIN_MAP_SHARD_CNT; ++i) {
+    if (OB_NOT_NULL(pin_shard_locks_[i])) {
+      lib::ObMutexGuard pin_guard(*pin_shard_locks_[i]);
+      (void)pin_map_shards_[i].foreach_refactored(pin_free_fn);
+      pin_map_shards_[i].destroy();
+    }
+  }
+  for (int64_t i = 0; i < IVF_CID_PIN_MAP_SHARD_CNT; ++i) {
+    if (OB_NOT_NULL(pin_shard_locks_[i])) {
+      OB_DELETE(IvfPinShardMutex, IVF_CID_CLUSTER_CACHE_LABEL, pin_shard_locks_[i]);
+      pin_shard_locks_[i] = nullptr;
+    }
+  }
+  common::ObArray<uint64_t> ledger_cids;
+  struct CollectLedgerCidFn
   {
-    lib::ObMutexGuard guard(lock_);
+    explicit CollectLedgerCidFn(common::ObArray<uint64_t> &cids) : cids_(cids) {}
+    int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterLedgerRecord> &pair)
+    {
+      return cids_.push_back(pair.first);
+    }
+    common::ObArray<uint64_t> &cids_;
+  } collect_ledger_fn(ledger_cids);
+  {
+    lib::ObMutexGuard guard(ledger_lock_);
+    (void)ledger_map_.foreach_refactored(collect_ledger_fn);
+  }
+  for (int64_t i = 0; i < ledger_cids.count(); ++i) {
+    (void)ledger_remove_(ledger_cids.at(i), false);
+  }
+  {
+    lib::ObMutexGuard guard(ledger_lock_);
+    ledger_map_.destroy();
+  }
+  {
+    lib::ObMutexGuard probe_guard(probe_heat_lock_);
     (void)probe_heat_map_.destroy();
   }
-  lib::ObMutexGuard guard(lock_);
-  struct EntryFreeFn
   {
-    int operator()(const CidClusterEntryPair &entry)
-    {
-      ObIvfCidClusterEntry *to_del = entry.second;
-      if (OB_NOT_NULL(to_del)) {
-        OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, to_del);
-      }
-      return OB_SUCCESS;
-    }
-  } free_fn;
-  entry_map_.foreach_refactored(free_fn);
-  entry_map_.destroy();
+    lib::ObMutexGuard fg_guard(fill_gates_lock_);
+    (void)refresh_target_map_.destroy();
+  }
   inited_ = false;
-  total_bytes_ = 0;
+  ledger_bytes_ = 0;
 }
 
 void ObIvfCidClusterCache::clear_all_fill_gates_()
@@ -743,6 +859,7 @@ void ObIvfCidClusterCache::clear_all_fill_gates_()
   lib::ObMutexGuard fg_guard(fill_gates_lock_);
   FillGateWakeAndFreeFn free_fn;
   (void)fill_gates_.foreach_refactored(free_fn);
+  (void)fill_gates_.clear();
 }
 
 void ObIvfCidClusterCache::inc_ref()
@@ -755,10 +872,219 @@ void ObIvfCidClusterCache::dec_ref()
   ATOMIC_SAF(&ref_cnt_, 1);
 }
 
-double ObIvfCidClusterCache::calc_heat_score(const ObIvfCidClusterEntry &e) const
+double ObIvfCidClusterCache::heat_score_(const ObIvfCidClusterHeat &heat, int64_t byte_denom) const
 {
-  const int64_t denom = OB_MAX(e.entry_bytes_, IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
-  return static_cast<double>(e.heat_.access_cnt_ + replay_heat_weight_ * e.heat_.replay_cnt_) / static_cast<double>(denom);
+  const int64_t denom = OB_MAX(byte_denom, IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
+  return static_cast<double>(heat.access_cnt_ + replay_heat_weight_ * heat.replay_cnt_)
+      / static_cast<double>(denom);
+}
+
+double ObIvfCidClusterCache::prospective_heat_score_locked_(uint64_t cid) const
+{
+  ObIvfCidClusterHeat heat;
+  if (OB_SUCCESS != probe_heat_map_.get_refactored(cid, heat)) {
+    heat.access_cnt_ = 1;
+    heat.replay_cnt_ = 0;
+  }
+  return heat_score_(heat, IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
+}
+
+bool ObIvfCidClusterCache::hotter_than_coldest_locked_(uint64_t skip_cid, double incoming_score) const
+{
+  double min_score = DBL_MAX;
+  uint64_t victim_cid = 0;
+  return find_coldest_evictable_ledger_locked_(skip_cid, min_score, victim_cid) && incoming_score > min_score;
+}
+
+void ObIvfCidClusterCache::release_pin_slot_(ObIvfCidClusterPinSlot *slot)
+{
+  if (OB_ISNULL(slot)) {
+  } else if (OB_NOT_NULL(slot->view_entry_)) {
+    slot->view_entry_->rowkey_objs_ = nullptr;
+    slot->view_entry_->kv_flat_buf_ = nullptr;
+    if (OB_NOT_NULL(slot->rowkey_objs_)) {
+      ob_free(slot->rowkey_objs_);
+      slot->rowkey_objs_ = nullptr;
+    }
+    OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, slot->view_entry_);
+    slot->view_entry_ = nullptr;
+  }
+  slot->kv_handle_.reset();
+  ob_free(slot);
+}
+
+int ObIvfCidClusterCache::install_pin_slot_locked_(uint64_t cid,
+    ObIvfCidClusterEntry *view_entry,
+    ObObj *rowkey_objs,
+    ObKVCacheHandle &kv_handle)
+{
+  int ret = OB_SUCCESS;
+  ObIvfCidClusterPinSlot *existing = nullptr;
+  if (OB_SUCCESS == pin_map_shard_(cid).get_refactored(cid, existing) && OB_NOT_NULL(existing)) {
+    release_dormant_pin_shard_locked_(cid, existing);
+  }
+  ObIvfCidClusterPinSlot *slot = static_cast<ObIvfCidClusterPinSlot *>(
+      ob_malloc(sizeof(ObIvfCidClusterPinSlot), IVF_CID_CLUSTER_CACHE_LABEL));
+  if (OB_ISNULL(slot)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    new (slot) ObIvfCidClusterPinSlot();
+    slot->view_entry_ = view_entry;
+    slot->rowkey_objs_ = rowkey_objs;
+    view_entry->rowkey_objs_ = rowkey_objs;
+    if (OB_FAIL(slot->kv_handle_.assign(kv_handle))) {
+      LOG_WARN("failed to assign kv handle", K(ret), K(cid));
+    } else if (OB_FAIL(pin_map_shard_(cid).set_refactored(cid, slot, IVF_MAP_OVERWRITE, 0, IVF_MAP_OVERWRITE))) {
+      LOG_WARN("failed to set pin slot", K(ret), K(cid));
+    } else {
+      return OB_SUCCESS;
+    }
+    release_pin_slot_(slot);
+  }
+  return ret;
+}
+
+int ObIvfCidClusterCache::ensure_ledger_room_locked_(
+    uint64_t skip_cid,
+    int64_t need_bytes,
+    double incoming_score)
+{
+  if (ledger_bytes_ + need_bytes <= max_bytes_) {
+    return OB_SUCCESS;
+  }
+  if (!hotter_than_coldest_locked_(skip_cid, incoming_score)) {
+    return OB_BUF_NOT_ENOUGH;
+  }
+  return ledger_evict_until_locked_(skip_cid, need_bytes);
+}
+
+int ObIvfCidClusterCache::ledger_remove_locked_(uint64_t cid, const bool count_evict, const bool erase_kv)
+{
+  int ret = OB_SUCCESS;
+  ObIvfCidClusterLedgerRecord rec;
+  if (OB_FAIL(ledger_map_.erase_refactored(cid, &rec))) {
+    if (ret != OB_HASH_NOT_EXIST) {
+      LOG_WARN("failed to erase ledger", K(ret), K(cid));
+    }
+  } else {
+    ledger_bytes_ -= rec.bytes_;
+    ATOMIC_DEC(&stats_.cur_entry_cnt_);
+    if (count_evict) {
+      ATOMIC_INC(&stats_.evict_entry_cnt_);
+      ATOMIC_AAF(&stats_.evict_bytes_, rec.bytes_);
+    }
+    if (erase_kv) {
+      ObIvfCidClusterKVKey kv_key(mgr_key_, cid);
+      (void)get_ivf_cid_cluster_kv_cache().erase_key(kv_key);
+    }
+  }
+  return ret;
+}
+
+int ObIvfCidClusterCache::ledger_put_locked_(uint64_t cid, int64_t bytes, const ObIvfCidClusterHeat &heat)
+{
+  int ret = OB_SUCCESS;
+  ObIvfCidClusterLedgerRecord rec;
+  ObIvfCidClusterLedgerRecord old_rec;
+  const bool had_old = (OB_SUCCESS == ledger_map_.get_refactored(cid, old_rec));
+  const int overwrite_flag = 1;
+  const int overwrite_key = 1;
+  if (had_old) {
+    ledger_bytes_ -= old_rec.bytes_;
+  } else {
+    ATOMIC_INC(&stats_.cur_entry_cnt_);
+  }
+  rec.bytes_ = bytes;
+  rec.heat_ = heat;
+  ledger_bytes_ += bytes;
+  if (OB_FAIL(ledger_map_.set_refactored(cid, rec, overwrite_flag, 0, overwrite_key))) {
+    LOG_WARN("failed to set ledger", K(ret), K(cid));
+    ledger_bytes_ -= bytes;
+    if (had_old) {
+      ledger_bytes_ += old_rec.bytes_;
+    } else {
+      ATOMIC_DEC(&stats_.cur_entry_cnt_);
+    }
+  }
+  return ret;
+}
+
+bool ObIvfCidClusterCache::find_coldest_evictable_ledger_locked_(
+    uint64_t skip_cid,
+    double &min_score,
+    uint64_t &victim_cid) const
+{
+  min_score = DBL_MAX;
+  victim_cid = 0;
+  int64_t oldest_access = INT64_MAX;
+  common::ObArray<uint64_t> cand_cids;
+  common::ObArray<double> cand_scores;
+  common::ObArray<int64_t> cand_access_us;
+  struct CollectFn
+  {
+    CollectFn(const ObIvfCidClusterCache &cache,
+        common::ObArray<uint64_t> &cids,
+        common::ObArray<double> &scores,
+        common::ObArray<int64_t> &access_us)
+        : cache_(cache), cids_(cids), scores_(scores), access_us_(access_us)
+    {}
+    int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterLedgerRecord> &pair)
+    {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(cids_.push_back(pair.first))) {
+      } else if (OB_FAIL(scores_.push_back(cache_.heat_score_(pair.second.heat_, pair.second.bytes_)))) {
+      } else if (OB_FAIL(access_us_.push_back(pair.second.heat_.last_access_us_))) {
+      }
+      return ret;
+    }
+    const ObIvfCidClusterCache &cache_;
+    common::ObArray<uint64_t> &cids_;
+    common::ObArray<double> &scores_;
+    common::ObArray<int64_t> &access_us_;
+  } collect_fn(*this, cand_cids, cand_scores, cand_access_us);
+  {
+    lib::ObMutexGuard guard(const_cast<ObIvfCidClusterCache *>(this)->ledger_lock_);
+    (void)ledger_map_.foreach_refactored(collect_fn);
+  }
+  for (int64_t i = 0; i < cand_cids.count(); ++i) {
+    const uint64_t cid = cand_cids.at(i);
+    if (cid == skip_cid) {
+    } else {
+      const double score = cand_scores.at(i);
+      const int64_t access_us = cand_access_us.at(i);
+      if (score < min_score || (score == min_score && access_us < oldest_access)) {
+        min_score = score;
+        oldest_access = access_us;
+        victim_cid = cid;
+      }
+    }
+  }
+  return victim_cid > 0;
+}
+
+int ObIvfCidClusterCache::ledger_evict_until_locked_(uint64_t skip_cid, int64_t need_bytes)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && ledger_bytes_ + need_bytes > max_bytes_) {
+    double min_score = DBL_MAX;
+    uint64_t victim_cid = 0;
+    if (!find_coldest_evictable_ledger_locked_(skip_cid, min_score, victim_cid)) {
+      ret = OB_BUF_NOT_ENOUGH;
+      break;
+    } else {
+      {
+        lib::ObMutexGuard pin_guard(pin_shard_lock_(victim_cid));
+        ObIvfCidClusterPinSlot *pin_slot = nullptr;
+        if (OB_SUCCESS == pin_map_shard_(victim_cid).get_refactored(victim_cid, pin_slot) && OB_NOT_NULL(pin_slot)) {
+          release_dormant_pin_shard_locked_(victim_cid, pin_slot);
+        }
+      }
+      if (OB_FAIL(ledger_remove_locked_(victim_cid, true))) {
+        LOG_WARN("failed to remove victim ledger", K(ret), K(victim_cid));
+      }
+    }
+  }
+  return ret;
 }
 
 void ObIvfCidClusterCache::bump_probe_heat_locked_(uint64_t cid)
@@ -780,143 +1106,10 @@ void ObIvfCidClusterCache::bump_probe_heat_locked_(uint64_t cid)
   }
 }
 
-double ObIvfCidClusterCache::calc_prospective_heat_score_(uint64_t cid) const
-{
-  ObIvfCidClusterHeat heat;
-  if (OB_SUCCESS != probe_heat_map_.get_refactored(cid, heat)) {
-    heat.access_cnt_ = 1;
-    heat.replay_cnt_ = 0;
-  }
-  return calc_probe_heat_score_(heat);
-}
-
-double ObIvfCidClusterCache::calc_probe_heat_score_(const ObIvfCidClusterHeat &heat) const
-{
-  return static_cast<double>(heat.access_cnt_ + replay_heat_weight_ * heat.replay_cnt_)
-      / static_cast<double>(IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
-}
-
-bool ObIvfCidClusterCache::is_probe_top_k_for_fill_locked_(uint64_t cid, const double target_score) const
-{
-  const int64_t top_k = ivf_cid_cluster_cache_fill_top_k(max_bytes_);
-  const int64_t min_probe_access = ivf_cid_cluster_cache_fill_min_probe_access();
-  int64_t strictly_higher = 0;
-  struct CountStrictlyHigherFn
-  {
-    CountStrictlyHigherFn(const uint64_t cid,
-        const double target_score,
-        const int64_t min_probe_access,
-        const int64_t replay_heat_weight,
-        int64_t &strictly_higher)
-        : cid_(cid),
-          target_score_(target_score),
-          min_probe_access_(min_probe_access),
-          replay_heat_weight_(replay_heat_weight),
-          strictly_higher_(strictly_higher)
-    {}
-    int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterHeat> &pair)
-    {
-      const ObIvfCidClusterHeat &heat = pair.second;
-      if (heat.access_cnt_ < min_probe_access_) {
-      } else if (pair.first != cid_) {
-        const double score = static_cast<double>(heat.access_cnt_ + replay_heat_weight_ * heat.replay_cnt_)
-            / static_cast<double>(IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
-        if (score > target_score_) {
-          strictly_higher_++;
-        }
-      }
-      return OB_SUCCESS;
-    }
-    uint64_t cid_;
-    double target_score_;
-    int64_t min_probe_access_;
-    int64_t replay_heat_weight_;
-    int64_t &strictly_higher_;
-  } count_fn(cid, target_score, min_probe_access, replay_heat_weight_, strictly_higher);
-  (void)probe_heat_map_.foreach_refactored(count_fn);
-  return strictly_higher < top_k;
-}
-
-bool ObIvfCidClusterCache::should_admit_fill_locked_(uint64_t cid)
-{
-  bump_probe_heat_locked_(cid);
-  ObIvfCidClusterHeat probe_heat;
-  int64_t probe_access = 1;
-  if (OB_SUCCESS == probe_heat_map_.get_refactored(cid, probe_heat)) {
-    probe_access = probe_heat.access_cnt_;
-  }
-  const int64_t min_probe_access = ivf_cid_cluster_cache_fill_min_probe_access();
-  if (probe_access < min_probe_access) {
-    ATOMIC_INC(&stats_.fill_bypass_cnt_);
-    return false;
-  }
-  const double new_score = calc_prospective_heat_score_(cid);
-  if (!is_probe_top_k_for_fill_locked_(cid, new_score)) {
-    ATOMIC_INC(&stats_.fill_bypass_cnt_);
-    return false;
-  }
-  if (total_bytes_ + IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES <= max_bytes_) {
-    return true;
-  }
-  EvictVictimPicker picker(replay_heat_weight_);
-  (void)entry_map_.foreach_refactored(picker);
-  if (OB_ISNULL(picker.victim_)) {
-    ATOMIC_INC(&stats_.fill_bypass_cnt_);
-    return false;
-  }
-  // Only replace when strictly hotter than the coldest evictable entry (equal → STORAGE_ONLY, avoid thrash).
-  if (new_score <= picker.min_score_) {
-    ATOMIC_INC(&stats_.fill_bypass_cnt_);
-    return false;
-  }
-  return true;
-}
-
 void ObIvfCidClusterCache::clear_probe_heat_locked_(uint64_t cid)
 {
+  lib::ObMutexGuard probe_guard(probe_heat_lock_);
   (void)probe_heat_map_.erase_refactored(cid);
-}
-
-int ObIvfCidClusterCache::erase_entry(const EntryMapKey &key, const bool count_evict)
-{
-  int ret = OB_SUCCESS;
-  ObIvfCidClusterEntry *entry = nullptr;
-  if (OB_FAIL(entry_map_.erase_refactored(key, &entry))) {
-    if (ret != OB_HASH_NOT_EXIST) {
-      LOG_WARN("failed to erase entry", K(ret), K(key.cid_));
-    }
-  } else if (OB_NOT_NULL(entry)) {
-    if (count_evict) {
-      ATOMIC_INC(&stats_.evict_entry_cnt_);
-      ATOMIC_AAF(&stats_.evict_bytes_, entry->entry_bytes_);
-    }
-    total_bytes_ -= entry->entry_bytes_;
-    ATOMIC_DEC(&stats_.cur_entry_cnt_);
-    OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, entry);
-  }
-  return ret;
-}
-
-int ObIvfCidClusterCache::evict_until(int64_t need_bytes)
-{
-  int ret = OB_SUCCESS;
-  while (total_bytes_ + need_bytes > max_bytes_ && entry_map_.size() > 0) {
-    EvictVictimPicker picker(replay_heat_weight_);
-    if (OB_FAIL(entry_map_.foreach_refactored(picker))) {
-      LOG_WARN("failed to foreach entry map", K(ret));
-      break;
-    } else if (OB_ISNULL(picker.victim_)) {
-      ret = OB_BUF_NOT_ENOUGH;
-      break;
-    } else if (OB_FAIL(erase_entry(picker.victim_key_, true))) {
-      LOG_WARN("failed to erase victim", K(ret));
-      break;
-    }
-  }
-  if (OB_SUCC(ret) && total_bytes_ + need_bytes > max_bytes_) {
-    ret = OB_BUF_NOT_ENOUGH;
-  }
-  return ret;
 }
 
 void ObIvfCidClusterCache::invalidate_all()
@@ -925,206 +1118,601 @@ void ObIvfCidClusterCache::invalidate_all()
     lib::ObMutexGuard fg_guard(fill_gates_lock_);
     FillGateWakeAndFreeFn free_fn;
     (void)fill_gates_.foreach_refactored(free_fn);
+    (void)fill_gates_.clear();
   }
-  lib::ObMutexGuard guard(lock_);
-  current_index_epoch_++;
-  common::ObArray<uint64_t> cids_to_erase;
-  struct CollectUnpinnedFn
+  for (int64_t s = 0; s < IVF_CID_PIN_MAP_SHARD_CNT; ++s) {
+    if (OB_ISNULL(pin_shard_locks_[s])) {
+    } else {
+      lib::ObMutexGuard pin_guard(*pin_shard_locks_[s]);
+      IvfPinInvalidateFn pin_invalidate_fn(pin_map_shards_[s], *this);
+      (void)pin_map_shards_[s].foreach_refactored(pin_invalidate_fn);
+    }
+  }
+  ATOMIC_INC(&current_index_epoch_);
+  common::ObArray<uint64_t> cids;
+  struct CollectLedgerCidFn
   {
-    explicit CollectUnpinnedFn(common::ObArray<uint64_t> &cids) : cids_(cids) {}
-    int operator()(const CidClusterEntryPair &entry)
+    explicit CollectLedgerCidFn(common::ObArray<uint64_t> &cids) : cids_(cids) {}
+    int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterLedgerRecord> &pair)
     {
-      ObIvfCidClusterEntry *e = entry.second;
-      if (OB_NOT_NULL(e) && e->pin_cnt_ == 0) {
-        (void)cids_.push_back(entry.first.cid_);
-      }
-      return OB_SUCCESS;
+      return cids_.push_back(pair.first);
     }
     common::ObArray<uint64_t> &cids_;
-  } collect_fn(cids_to_erase);
-  (void)entry_map_.foreach_refactored(collect_fn);
-  for (int64_t i = 0; i < cids_to_erase.count(); ++i) {
-    (void)erase_entry(EntryMapKey(cids_to_erase.at(i)), false);
+  } collect_ledger_fn(cids);
+  {
+    lib::ObMutexGuard guard(ledger_lock_);
+    (void)ledger_map_.foreach_refactored(collect_ledger_fn);
+  }
+  for (int64_t i = 0; i < cids.count(); ++i) {
+    (void)ledger_remove_(cids.at(i), false);
+  }
+  {
+    lib::ObMutexGuard probe_guard(probe_heat_lock_);
+    (void)probe_heat_map_.clear();
   }
   ATOMIC_INC(&stats_.invalidate_cnt_);
+  store_phase_(ObIvfCidClusterCachePhase::LEARNING);
+  ATOMIC_STORE(&total_access_samples_, 0);
+  ATOMIC_STORE(&serving_miss_samples_, 0);
+  ATOMIC_STORE(&refresh_targets_remaining_, 0);
+  {
+    lib::ObMutexGuard fg_guard(fill_gates_lock_);
+    (void)refresh_target_map_.clear();
+  }
+  ATOMIC_INC(&stats_.phase_learning_cnt_);
 }
 
-int ObIvfCidClusterCache::unpin_entry(ObIvfCidClusterEntry *entry)
+ObIvfCidClusterCachePhase ObIvfCidClusterCache::load_phase_() const
 {
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(entry)) {
-  } else {
-    lib::ObMutexGuard guard(lock_);
-    EntryMapKey key(entry->cid_);
-    ObIvfCidClusterEntry *stored = nullptr;
-    if (OB_FAIL(entry_map_.get_refactored(key, stored))) {
-      if (ret != OB_HASH_NOT_EXIST) {
-        LOG_WARN("failed to lookup entry on unpin", K(ret), K(key.cid_));
+  return static_cast<ObIvfCidClusterCachePhase>(ATOMIC_LOAD(&cache_phase_));
+}
+
+void ObIvfCidClusterCache::store_phase_(ObIvfCidClusterCachePhase phase)
+{
+  ATOMIC_STORE(&cache_phase_, static_cast<int64_t>(phase));
+}
+
+bool ObIvfCidClusterCache::cas_phase_(ObIvfCidClusterCachePhase expected, ObIvfCidClusterCachePhase desired)
+{
+  const int64_t exp = static_cast<int64_t>(expected);
+  const int64_t des = static_cast<int64_t>(desired);
+  return ATOMIC_VCAS(&cache_phase_, exp, des) == exp;
+}
+
+int64_t ObIvfCidClusterCache::learning_start_threshold_() const
+{
+  const int64_t min_probe = ivf_cid_cluster_cache_fill_min_probe_access();
+  return min_probe > 0 ? min_probe : DEFAULT_IVF_CID_CLUSTER_CACHE_FILL_MIN_PROBE_ACCESS;
+}
+
+void ObIvfCidClusterCache::record_access_(uint64_t cid, ObIvfCidClusterCachePhase phase)
+{
+  ATOMIC_INC(&total_access_samples_);
+  if (phase == ObIvfCidClusterCachePhase::LEARNING) {
+    lib::ObMutexGuard probe_guard(probe_heat_lock_);
+    bump_probe_heat_locked_(cid);
+  }
+}
+
+bool ObIvfCidClusterCache::is_refresh_target_cid_(uint64_t cid) const
+{
+  int8_t state = 1;
+  lib::ObMutexGuard fg_guard(const_cast<lib::ObMutex &>(fill_gates_lock_));
+  if (OB_SUCCESS != refresh_target_map_.get_refactored(cid, state)) {
+    return false;
+  }
+  return state == 0;
+}
+
+void ObIvfCidClusterCache::mark_refresh_target_done_(uint64_t cid)
+{
+  lib::ObMutexGuard fg_guard(fill_gates_lock_);
+  int8_t state = 0;
+  if (OB_SUCCESS == refresh_target_map_.get_refactored(cid, state) && state == 0) {
+  const int overwrite_flag = 1;
+  const int overwrite_key = 1;
+    (void)refresh_target_map_.set_refactored(cid, static_cast<int8_t>(1), overwrite_flag, 0, overwrite_key);
+    ATOMIC_DEC(&refresh_targets_remaining_);
+  }
+}
+
+void ObIvfCidClusterCache::prepare_refresh_targets_(bool use_ledger_heat)
+{
+  common::ObArray<uint64_t> cids;
+  common::ObArray<double> scores;
+  const int64_t top_k = ivf_cid_cluster_cache_fill_top_k(max_bytes_);
+  const int64_t min_probe = ivf_cid_cluster_cache_fill_min_probe_access();
+  if (use_ledger_heat) {
+    lib::ObMutexGuard ledger_guard(ledger_lock_);
+    struct CollectLedgerFn
+    {
+      CollectLedgerFn(const ObIvfCidClusterCache &cache, common::ObArray<uint64_t> &cids, common::ObArray<double> &scores)
+          : cache_(cache), cids_(cids), scores_(scores)
+      {}
+      int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterLedgerRecord> &pair)
+      {
+        int ret = OB_SUCCESS;
+        const double score = cache_.heat_score_(pair.second.heat_, pair.second.bytes_ > 0 ? pair.second.bytes_ : IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
+        if (OB_FAIL(cids_.push_back(pair.first))) {
+        } else if (OB_FAIL(scores_.push_back(score))) {
+        }
+        return ret;
       }
-    } else if (stored == entry && entry->pin_cnt_ > 0) {
-      entry->pin_cnt_--;
-      if (entry->pin_cnt_ == 0 && entry->index_epoch_ != current_index_epoch_) {
-        (void)erase_entry(key, false);
+      const ObIvfCidClusterCache &cache_;
+      common::ObArray<uint64_t> &cids_;
+      common::ObArray<double> &scores_;
+    } collect_fn(*this, cids, scores);
+    (void)ledger_map_.foreach_refactored(collect_fn);
+  } else {
+    lib::ObMutexGuard probe_guard(probe_heat_lock_);
+    struct CollectProbeFn
+    {
+      CollectProbeFn(const ObIvfCidClusterCache &cache,
+          const int64_t min_probe,
+          common::ObArray<uint64_t> &cids,
+          common::ObArray<double> &scores)
+          : cache_(cache), min_probe_(min_probe), cids_(cids), scores_(scores)
+      {}
+      int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterHeat> &pair)
+      {
+        int ret = OB_SUCCESS;
+        if (pair.second.access_cnt_ < min_probe_) {
+        } else {
+          const double score = cache_.heat_score_(pair.second, IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES);
+          if (OB_FAIL(cids_.push_back(pair.first))) {
+          } else if (OB_FAIL(scores_.push_back(score))) {
+          }
+        }
+        return ret;
+      }
+      const ObIvfCidClusterCache &cache_;
+      int64_t min_probe_;
+      common::ObArray<uint64_t> &cids_;
+      common::ObArray<double> &scores_;
+    } collect_fn(*this, min_probe, cids, scores);
+    (void)probe_heat_map_.foreach_refactored(collect_fn);
+  }
+  lib::ObMutexGuard fg_guard(fill_gates_lock_);
+  (void)refresh_target_map_.clear();
+  int64_t picked = 0;
+  for (int64_t pick = 0; pick < top_k && pick < cids.count(); ++pick) {
+    int64_t best_i = pick;
+    for (int64_t j = pick + 1; j < cids.count(); ++j) {
+      if (scores.at(j) > scores.at(best_i)) {
+        best_i = j;
       }
     }
+    if (best_i != pick) {
+      const uint64_t tmp_cid = cids.at(pick);
+      const double tmp_score = scores.at(pick);
+      cids.at(pick) = cids.at(best_i);
+      scores.at(pick) = scores.at(best_i);
+      cids.at(best_i) = tmp_cid;
+      scores.at(best_i) = tmp_score;
+    }
+    (void)refresh_target_map_.set_refactored(cids.at(pick), static_cast<int8_t>(0));
+    ++picked;
   }
-  return ret;
+  ATOMIC_STORE(&refresh_targets_remaining_, picked);
 }
 
-int ObIvfCidClusterCache::try_pin_ready_entry_(uint64_t cid, ObIvfCidClusterEntry *&entry)
+void ObIvfCidClusterCache::try_begin_refresh_from_learning_()
+{
+  if (load_phase_() != ObIvfCidClusterCachePhase::LEARNING) {
+    return;
+  }
+  const int64_t threshold = learning_start_threshold_();
+  int64_t hot_cnt = 0;
+  {
+    lib::ObMutexGuard probe_guard(probe_heat_lock_);
+    struct CountHotFn
+    {
+      explicit CountHotFn(const int64_t threshold, int64_t &hot_cnt) : threshold_(threshold), hot_cnt_(hot_cnt) {}
+      int operator()(const common::hash::HashMapPair<uint64_t, ObIvfCidClusterHeat> &pair)
+      {
+        if (pair.second.access_cnt_ >= threshold_) {
+          hot_cnt_++;
+        }
+        return OB_SUCCESS;
+      }
+      int64_t threshold_;
+      int64_t &hot_cnt_;
+    } count_fn(threshold, hot_cnt);
+    (void)probe_heat_map_.foreach_refactored(count_fn);
+  }
+  if (hot_cnt <= 0) {
+    return;
+  }
+  if (!cas_phase_(ObIvfCidClusterCachePhase::LEARNING, ObIvfCidClusterCachePhase::REFRESHING)) {
+    return;
+  }
+  prepare_refresh_targets_(false);
+  if (ATOMIC_LOAD(&refresh_targets_remaining_) <= 0) {
+    (void)cas_phase_(ObIvfCidClusterCachePhase::REFRESHING, ObIvfCidClusterCachePhase::LEARNING);
+    return;
+  }
+  ATOMIC_INC(&stats_.phase_refreshing_cnt_);
+}
+
+void ObIvfCidClusterCache::try_begin_refresh_from_serving_()
+{
+  if (load_phase_() != ObIvfCidClusterCachePhase::SERVING) {
+    return;
+  }
+  const int64_t access = ATOMIC_LOAD(&total_access_samples_);
+  const int64_t miss = ATOMIC_LOAD(&serving_miss_samples_);
+  if (access < 1000 || miss * 100 / access < 30) {
+    return;
+  }
+  if (!cas_phase_(ObIvfCidClusterCachePhase::SERVING, ObIvfCidClusterCachePhase::REFRESHING)) {
+    return;
+  }
+  prepare_refresh_targets_(true);
+  if (ATOMIC_LOAD(&refresh_targets_remaining_) <= 0) {
+    (void)cas_phase_(ObIvfCidClusterCachePhase::REFRESHING, ObIvfCidClusterCachePhase::SERVING);
+    return;
+  }
+  ATOMIC_STORE(&total_access_samples_, 0);
+  ATOMIC_STORE(&serving_miss_samples_, 0);
+  ATOMIC_INC(&stats_.phase_refreshing_cnt_);
+}
+
+int ObIvfCidClusterCache::warm_readonly_pin_slots_()
+{
+  common::ObArray<uint64_t> cids;
+  {
+    lib::ObMutexGuard fg_guard(fill_gates_lock_);
+    struct CollectTargetFn
+    {
+      explicit CollectTargetFn(common::ObArray<uint64_t> &cids) : cids_(cids) {}
+      int operator()(const common::hash::HashMapPair<uint64_t, int8_t> &pair)
+      {
+        if (pair.second == 1) {
+          return cids_.push_back(pair.first);
+        }
+        return OB_SUCCESS;
+      }
+      common::ObArray<uint64_t> &cids_;
+    } collect_fn(cids);
+    (void)refresh_target_map_.foreach_refactored(collect_fn);
+  }
+  for (int64_t i = 0; i < cids.count(); ++i) {
+    (void)warm_pin_slot_(cids.at(i));
+  }
+  return OB_SUCCESS;
+}
+
+void ObIvfCidClusterCache::finalize_refresh_to_serving_()
+{
+  (void)warm_readonly_pin_slots_();
+  if (cas_phase_(ObIvfCidClusterCachePhase::REFRESHING, ObIvfCidClusterCachePhase::SERVING)) {
+    ATOMIC_INC(&stats_.phase_serving_cnt_);
+    ATOMIC_STORE(&total_access_samples_, 0);
+    ATOMIC_STORE(&serving_miss_samples_, 0);
+  }
+  {
+    lib::ObMutexGuard fg_guard(fill_gates_lock_);
+    (void)refresh_target_map_.clear();
+  }
+  ATOMIC_STORE(&refresh_targets_remaining_, 0);
+}
+
+void ObIvfCidClusterCache::try_finalize_refresh_if_complete_()
+{
+  if (load_phase_() != ObIvfCidClusterCachePhase::REFRESHING) {
+    return;
+  }
+  if (ATOMIC_LOAD(&refresh_targets_remaining_) > 0) {
+    return;
+  }
+  finalize_refresh_to_serving_();
+}
+
+void ObIvfCidClusterCache::notify_refresh_put_done(uint64_t cid)
+{
+  mark_refresh_target_done_(cid);
+  try_finalize_refresh_if_complete_();
+}
+
+int ObIvfCidClusterCache::lookup_readonly_serving_(uint64_t cid, ObIvfCidClusterEntry *&entry)
 {
   int ret = OB_SUCCESS;
   entry = nullptr;
-  const int64_t now = ObTimeUtility::current_time();
-  const EntryMapKey key(cid);
-  if (OB_FAIL(entry_map_.get_refactored(key, entry))) {
-    if (ret == OB_HASH_NOT_EXIST) {
-      ATOMIC_INC(&stats_.get_miss_cnt_);
-    } else {
-      LOG_WARN("failed to get cluster entry", K(ret), K(cid));
+  const uint64_t epoch = load_index_epoch_();
+  {
+    lib::ObMutexGuard guard(pin_shard_lock_(cid));
+    ObIvfCidClusterPinSlot *slot = nullptr;
+    if (OB_SUCCESS == pin_map_shard_(cid).get_refactored(cid, slot) && OB_NOT_NULL(slot) && OB_NOT_NULL(slot->view_entry_)) {
+      if (slot->view_entry_->index_epoch_ == epoch) {
+        entry = slot->view_entry_;
+        entry->session_borrowed_ = true;
+        ATOMIC_INC(&stats_.get_hit_cnt_);
+        return OB_SUCCESS;
+      }
     }
-  } else if (OB_ISNULL(entry)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (entry->index_epoch_ != current_index_epoch_) {
-    ATOMIC_INC(&stats_.get_stale_epoch_cnt_);
+  }
+  ObIvfKvPinPrep prep;
+  const int prep_ret = load_kv_pin_prep_(cid, epoch, prep);
+  if (prep_ret != OB_SUCCESS) {
     ATOMIC_INC(&stats_.get_miss_cnt_);
-    entry = nullptr;
-    ret = OB_HASH_NOT_EXIST;
-  } else {
-    ATOMIC_INC(&stats_.get_hit_cnt_);
-    entry->pin_cnt_++;
-    entry->heat_.access_cnt_++;
-    entry->heat_.replay_cnt_++;
-    entry->heat_.last_access_us_ = now;
-    ObIvfCidClusterHeat probe_heat;
-    if (OB_SUCCESS == probe_heat_map_.get_refactored(cid, probe_heat)) {
-      entry->heat_.access_cnt_ += probe_heat.access_cnt_;
-      entry->heat_.replay_cnt_ += probe_heat.replay_cnt_;
-      (void)probe_heat_map_.erase_refactored(cid);
+    ATOMIC_INC(&serving_miss_samples_);
+    return prep_ret;
+  }
+  prep.view_entry_->session_owned_ = true;
+  if (OB_FAIL(prep.view_entry_->session_kv_handle_.assign(prep.kv_handle_))) {
+    discard_kv_pin_prep_(prep);
+    ATOMIC_INC(&stats_.get_miss_cnt_);
+    ATOMIC_INC(&serving_miss_samples_);
+    return OB_ERR_UNEXPECTED;
+  }
+  entry = prep.view_entry_;
+  prep.view_entry_ = nullptr;
+  prep.kv_handle_.reset();
+  ATOMIC_INC(&stats_.get_hit_cnt_);
+  return OB_SUCCESS;
+}
+
+void ObIvfCidClusterCache::release_session_entry(ObIvfCidClusterEntry *entry)
+{
+  if (OB_ISNULL(entry)) {
+    return;
+  }
+  if (entry->session_owned_) {
+    entry->session_kv_handle_.reset();
+    entry->session_owned_ = false;
+    OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, entry);
+    return;
+  }
+  if (entry->session_borrowed_) {
+    entry->session_borrowed_ = false;
+  }
+}
+
+int ObIvfCidClusterCache::warm_pin_slot_(uint64_t cid)
+{
+  const uint64_t epoch = load_index_epoch_();
+  {
+    lib::ObMutexGuard guard(pin_shard_lock_(cid));
+    ObIvfCidClusterPinSlot *slot = nullptr;
+    if (OB_SUCCESS == pin_map_shard_(cid).get_refactored(cid, slot) && OB_NOT_NULL(slot)
+        && OB_NOT_NULL(slot->view_entry_) && slot->view_entry_->index_epoch_ == epoch) {
+      return OB_SUCCESS;
     }
+  }
+  ObIvfKvPinPrep prep;
+  int ret = load_kv_pin_prep_(cid, epoch, prep);
+  if (OB_HASH_NOT_EXIST == ret) {
+    reconcile_kv_pin_miss_locked_(cid);
+    (void)ledger_remove_(cid, false);
+    return ret;
+  } else if (OB_FAIL(ret)) {
+    return ret;
+  }
+  {
+    lib::ObMutexGuard guard(pin_shard_lock_(cid));
+    ret = install_pin_slot_locked_(cid, prep.view_entry_, prep.rowkey_objs_, prep.kv_handle_);
+  }
+  if (OB_SUCC(ret)) {
+    prep.view_entry_ = nullptr;
+    prep.rowkey_objs_ = nullptr;
+    prep.kv_handle_.reset();
+  } else {
+    discard_kv_pin_prep_(prep);
   }
   return ret;
 }
 
-int ObIvfCidClusterCache::acquire_cid_cluster(
+void ObIvfCidClusterCache::discard_kv_pin_prep_(ObIvfKvPinPrep &prep)
+{
+  if (OB_NOT_NULL(prep.view_entry_)) {
+    prep.view_entry_->rowkey_objs_ = nullptr;
+    prep.view_entry_->kv_flat_buf_ = nullptr;
+    if (OB_NOT_NULL(prep.rowkey_objs_)) {
+      ob_free(prep.rowkey_objs_);
+      prep.rowkey_objs_ = nullptr;
+    }
+    OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, prep.view_entry_);
+    prep.view_entry_ = nullptr;
+  }
+  prep.kv_handle_.reset();
+  prep.flat_buf_ = nullptr;
+  prep.flat_len_ = 0;
+  prep.rowkey_obj_cnt_ = 0;
+}
+
+int ObIvfCidClusterCache::load_kv_pin_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvPinPrep &prep)
+{
+  int ret = OB_SUCCESS;
+  discard_kv_pin_prep_(prep);
+  ObIvfCidClusterKVKey kv_key(mgr_key_, cid);
+  const char *flat_buf = nullptr;
+  int64_t flat_len = 0;
+  ObKVCacheHandle kv_handle;
+  if (OB_FAIL(get_ivf_cid_cluster_kv_cache().get_flat(kv_key, flat_buf, flat_len, kv_handle))) {
+    if (ret == OB_ENTRY_NOT_EXIST) {
+      ATOMIC_INC(&stats_.get_miss_cnt_);
+      return OB_HASH_NOT_EXIST;
+    }
+    LOG_WARN("failed to get flat cluster from kv", K(ret), K(cid));
+    return ret;
+  }
+  if (OB_ISNULL(flat_buf) || flat_len <= 0) {
+    return OB_ERR_UNEXPECTED;
+  }
+  const ObIvfCidFlatHeader *hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(flat_buf);
+  if (hdr->index_epoch_ != index_epoch) {
+    ATOMIC_INC(&stats_.get_stale_epoch_cnt_);
+    ATOMIC_INC(&stats_.get_miss_cnt_);
+    return OB_HASH_NOT_EXIST;
+  }
+  ObIvfCidClusterEntry *view_entry = nullptr;
+  ObObj *rk_objs = nullptr;
+  int64_t rk_cnt = 0;
+  if (OB_FAIL(ivf_cid_flat_attach_entry(flat_buf, flat_len, view_entry, rk_objs, rk_cnt))) {
+    LOG_WARN("failed to attach flat entry", K(ret), K(cid));
+    return ret;
+  }
+  prep.flat_buf_ = flat_buf;
+  prep.flat_len_ = flat_len;
+  prep.view_entry_ = view_entry;
+  prep.rowkey_objs_ = rk_objs;
+  prep.rowkey_obj_cnt_ = rk_cnt;
+  if (OB_FAIL(prep.kv_handle_.assign(kv_handle))) {
+    LOG_WARN("failed to assign kv handle for kv pin prep", K(ret), K(cid));
+    discard_kv_pin_prep_(prep);
+    return ret;
+  }
+  return OB_SUCCESS;
+}
+
+void ObIvfCidClusterCache::reconcile_kv_pin_miss_locked_(uint64_t cid)
+{
+  ObIvfCidClusterKVKey kv_key(mgr_key_, cid);
+  const char *flat_buf = nullptr;
+  int64_t flat_len = 0;
+  ObKVCacheHandle kv_handle;
+  if (OB_SUCCESS == get_ivf_cid_cluster_kv_cache().get_flat(kv_key, flat_buf, flat_len, kv_handle)) {
+    const ObIvfCidFlatHeader *hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(flat_buf);
+    if (OB_NOT_NULL(hdr) && hdr->index_epoch_ != load_index_epoch_()) {
+      (void)get_ivf_cid_cluster_kv_cache().erase_key(kv_key);
+    }
+  }
+}
+
+int ObIvfCidClusterCache::lookup_cid(
     uint64_t cid,
     ObIvfCidClusterEntry *&entry,
-    bool &is_fill_leader,
-    bool &storage_only,
+    ObIvfCidClusterLookupResult &result,
     ObIvfCidClusterCacheSessionStats *session_stats)
 {
   int ret = OB_SUCCESS;
-  is_fill_leader = false;
-  storage_only = false;
   entry = nullptr;
+  result = ObIvfCidClusterLookupResult::MISS;
   if (!inited_) {
     ret = OB_NOT_INIT;
-  }
-  while (OB_SUCC(ret)) {
-    {
-      lib::ObMutexGuard guard(lock_);
-      ret = try_pin_ready_entry_(cid, entry);
-    }
-    if (OB_SUCCESS == ret) {
-      break;
-    }
-    if (OB_HASH_NOT_EXIST != ret) {
-      break;
-    }
-    ret = OB_SUCCESS;
-
-    {
-      lib::ObMutexGuard guard(lock_);
-      if (!should_admit_fill_locked_(cid)) {
-        storage_only = true;
-        break;
+  } else {
+    const ObIvfCidClusterCachePhase phase = load_phase_();
+    record_access_(cid, phase);
+    if (phase == ObIvfCidClusterCachePhase::LEARNING) {
+      try_begin_refresh_from_learning_();
+    } else if (phase == ObIvfCidClusterCachePhase::REFRESHING) {
+      ret = lookup_cid_refreshing_(cid, entry, result, session_stats);
+    } else {
+      const int serving_ret = lookup_readonly_serving_(cid, entry);
+      if (OB_SUCCESS == serving_ret) {
+        result = ObIvfCidClusterLookupResult::HIT;
+      } else if (OB_HASH_NOT_EXIST == serving_ret) {
+        result = ObIvfCidClusterLookupResult::MISS;
+        try_begin_refresh_from_serving_();
+      } else {
+        ret = serving_ret;
       }
     }
+  }
+  return ret;
+}
 
-    ObIvfCidFillGate *gate = nullptr;
-    bool wait_fill = false;
-    {
-      lib::ObMutexGuard fg_guard(fill_gates_lock_);
-      if (OB_FAIL(fill_gates_.get_refactored(cid, gate))) {
-        if (ret == OB_HASH_NOT_EXIST) {
-          ret = OB_SUCCESS;
-          void *buf = ob_malloc(sizeof(ObIvfCidFillGate), IVF_CID_CLUSTER_CACHE_LABEL);
-          if (OB_ISNULL(buf)) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-          } else {
-            gate = new (buf) ObIvfCidFillGate(cid);
-            if (OB_FAIL(gate->cond_.init(common::ObWaitEventIds::THREAD_IDLING_COND_WAIT))) {
-              LOG_WARN("failed to init fill gate cond", K(ret), K(cid));
-              gate->dec_ref();
-              gate = nullptr;
-            } else if (OB_FAIL(fill_gates_.set_refactored(cid, gate))) {
-              if (ret == OB_HASH_EXIST) {
-                ret = OB_SUCCESS;
-                gate->dec_ref();
-                gate = nullptr;
-                (void)fill_gates_.get_refactored(cid, gate);
-              } else {
-                LOG_WARN("failed to set fill gate", K(ret), K(cid));
-                gate->dec_ref();
-                gate = nullptr;
-              }
-            }
-          }
-          if (OB_SUCC(ret) && OB_NOT_NULL(gate)) {
-            if (OB_FAIL(gate->cond_.lock())) {
-              LOG_WARN("failed to lock new fill gate", K(ret), K(cid));
+int ObIvfCidClusterCache::lookup_cid_refreshing_(
+    uint64_t cid,
+    ObIvfCidClusterEntry *&entry,
+    ObIvfCidClusterLookupResult &result,
+    ObIvfCidClusterCacheSessionStats *session_stats)
+{
+  int ret = OB_SUCCESS;
+  entry = nullptr;
+  result = ObIvfCidClusterLookupResult::MISS;
+  if (!is_refresh_target_cid_(cid)) {
+    return OB_SUCCESS;
+  }
+  bool is_fill_leader = false;
+  ObIvfCidFillGate *gate = nullptr;
+  while (OB_SUCC(ret)) {
+      bool wait_fill = false;
+      {
+        lib::ObMutexGuard fg_guard(fill_gates_lock_);
+        if (OB_FAIL(fill_gates_.get_refactored(cid, gate))) {
+          if (ret == OB_HASH_NOT_EXIST) {
+            ret = OB_SUCCESS;
+            void *buf = ob_malloc(sizeof(ObIvfCidFillGate), IVF_CID_CLUSTER_CACHE_LABEL);
+            if (OB_ISNULL(buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
             } else {
-              gate->filling_ = true;
-              (void)gate->cond_.unlock();
-              {
-                lib::ObMutexGuard guard(lock_);
-                if (OB_SUCCESS == try_pin_ready_entry_(cid, entry)) {
-                  if (OB_SUCCESS == gate->cond_.lock()) {
-                    gate->filling_ = false;
-                    (void)gate->cond_.broadcast();
-                    (void)gate->cond_.unlock();
-                  }
-                  (void)fill_gates_.erase_refactored(cid);
+              gate = new (buf) ObIvfCidFillGate(cid);
+              if (OB_FAIL(gate->cond_.init(common::ObWaitEventIds::THREAD_IDLING_COND_WAIT))) {
+                LOG_WARN("failed to init fill gate cond", K(ret), K(cid));
+                gate->dec_ref();
+                gate = nullptr;
+              } else if (OB_FAIL(fill_gates_.set_refactored(cid, gate))) {
+                if (ret == OB_HASH_EXIST) {
+                  ret = OB_SUCCESS;
                   gate->dec_ref();
-                  break;
+                  gate = nullptr;
+                  (void)fill_gates_.get_refactored(cid, gate);
+                } else {
+                  LOG_WARN("failed to set fill gate", K(ret), K(cid));
+                  gate->dec_ref();
+                  gate = nullptr;
                 }
               }
-              is_fill_leader = true;
-              break;
+            }
+            if (OB_SUCC(ret) && OB_NOT_NULL(gate)) {
+              if (OB_FAIL(gate->cond_.lock())) {
+                LOG_WARN("failed to lock new fill gate", K(ret), K(cid));
+                (void)fill_gates_.erase_refactored(cid);
+                gate->dec_ref();
+                gate = nullptr;
+                ret = OB_SUCCESS;
+              } else {
+                gate->filling_ = true;
+                (void)gate->cond_.unlock();
+                is_fill_leader = true;
+                gate->inc_ref();
+                break;
+              }
+            }
+          } else {
+            LOG_WARN("failed to get fill gate", K(ret), K(cid));
+          }
+        } else if (OB_NOT_NULL(gate) && gate->filling_) {
+          wait_fill = true;
+          gate->inc_ref();
+        } else if (OB_NOT_NULL(gate)) {
+          (void)fill_gates_.erase_refactored(cid);
+          gate->dec_ref();
+        }
+      }
+
+      if (OB_SUCC(ret) && wait_fill && OB_NOT_NULL(gate)) {
+        if (OB_FAIL(gate->cond_.lock())) {
+          LOG_WARN("failed to lock fill gate for wait", K(ret), K(cid));
+          gate->dec_ref();
+        } else {
+          const int64_t wait_beg_us = ObTimeUtility::current_time();
+          while (OB_SUCC(ret) && gate->filling_) {
+            ATOMIC_INC(&stats_.fill_wait_cnt_);
+            if (OB_NOT_NULL(session_stats)) {
+              session_stats->fill_wait_cnt_++;
+            }
+            if (OB_FAIL(gate->cond_.wait())) {
+              LOG_WARN("failed to wait on fill gate", K(ret), K(cid));
             }
           }
-        } else {
-          LOG_WARN("failed to get fill gate", K(ret), K(cid));
-        }
-      } else if (OB_NOT_NULL(gate) && gate->filling_) {
-        wait_fill = true;
-      }
-    }
-
-    if (OB_SUCC(ret) && wait_fill && OB_NOT_NULL(gate)) {
-      gate->inc_ref();
-      if (OB_FAIL(gate->cond_.lock())) {
-        LOG_WARN("failed to lock fill gate for wait", K(ret), K(cid));
-        gate->dec_ref();
-      } else {
-        const int64_t wait_beg_us = ObTimeUtility::current_time();
-        while (OB_SUCC(ret) && gate->filling_) {
-          ATOMIC_INC(&stats_.fill_wait_cnt_);
           if (OB_NOT_NULL(session_stats)) {
-            session_stats->fill_wait_cnt_++;
+            session_stats->fill_wait_us_ += ObTimeUtility::current_time() - wait_beg_us;
           }
-          if (OB_FAIL(gate->cond_.wait())) {
-            LOG_WARN("failed to wait on fill gate", K(ret), K(cid));
-          }
+          (void)gate->cond_.unlock();
+          gate->dec_ref();
+          continue;
         }
-        if (OB_NOT_NULL(session_stats)) {
-          session_stats->fill_wait_us_ += ObTimeUtility::current_time() - wait_beg_us;
-        }
-        (void)gate->cond_.unlock();
-        gate->dec_ref();
       }
     }
-  }
+    if (OB_SUCC(ret)) {
+      if (is_fill_leader) {
+        result = ObIvfCidClusterLookupResult::FILL_LEADER;
+      } else {
+        result = ObIvfCidClusterLookupResult::MISS;
+      }
+    }
   return ret;
 }
 
@@ -1143,77 +1731,88 @@ void ObIvfCidClusterCache::finish_cid_fill(uint64_t cid)
     (void)gate->cond_.broadcast();
     (void)gate->cond_.unlock();
   }
+  // Leader inc_ref in acquire; gate also has its alloc ref — drop both after erase from map.
+  gate->dec_ref();
   gate->dec_ref();
 }
 
 int ObIvfCidClusterCache::put(ObIvfCidClusterEntry &entry)
 {
   int ret = OB_SUCCESS;
-  if (max_rows_per_cid_ > 0 && entry.row_count_ > max_rows_per_cid_) {
+  if (load_phase_() != ObIvfCidClusterCachePhase::REFRESHING) {
+    return OB_STATE_NOT_MATCH;
+  } else if (max_rows_per_cid_ > 0 && entry.row_count_ > max_rows_per_cid_) {
     ret = OB_SIZE_OVERFLOW;
     ATOMIC_INC(&stats_.put_skip_rows_limit_cnt_);
   } else {
-    lib::ObMutexGuard guard(lock_);
-    entry.index_epoch_ = current_index_epoch_;
-    const EntryMapKey key(entry.cid_);
-    ObIvfCidClusterEntry *stored = nullptr;
-    if (OB_FAIL(entry_map_.get_refactored(key, stored))) {
-      if (ret == OB_HASH_NOT_EXIST) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("failed to lookup entry", K(ret));
+    const uint64_t cid = entry.cid_;
+    const double incoming_score = prospective_heat_score_locked_(entry.cid_);
+    if (ledger_bytes_ + entry.entry_bytes_ > max_bytes_ && !hotter_than_coldest_locked_(cid, incoming_score)) {
+      ATOMIC_INC(&stats_.put_skip_cap_cnt_);
+      return OB_BUF_NOT_ENOUGH;
+    }
+    {
+      lib::ObMutexGuard pin_guard(pin_shard_lock_(cid));
+      ObIvfCidClusterPinSlot *pin_slot = nullptr;
+      if (OB_SUCCESS == pin_map_shard_(cid).get_refactored(cid, pin_slot) && OB_NOT_NULL(pin_slot)) {
+        release_dormant_pin_shard_locked_(cid, pin_slot);
       }
     }
-    if (OB_SUCC(ret) && OB_NOT_NULL(stored)) {
-      if (stored->pin_cnt_ > 0) {
-        ATOMIC_INC(&stats_.put_skip_pinned_cnt_);
-        return OB_EAGAIN;
-      } else if (stored->index_epoch_ == current_index_epoch_) {
-        if (OB_FAIL(erase_entry(key, false))) {
-          LOG_WARN("failed to erase old cluster entry before put", K(ret), K(key.cid_));
-        }
-      } else if (OB_FAIL(erase_entry(key, false))) {
-        LOG_WARN("failed to erase stale epoch cluster entry before put", K(ret), K(key.cid_));
+    {
+      lib::ObMutexGuard ledger_guard(ledger_lock_);
+      const uint64_t fill_epoch = entry.index_epoch_;
+      const uint64_t cur_epoch = load_index_epoch_();
+      if (fill_epoch != 0 && fill_epoch != cur_epoch) {
+        ATOMIC_INC(&stats_.get_stale_epoch_cnt_);
+        return OB_STATE_NOT_MATCH;
       }
-    }
-    if (OB_SUCC(ret)) {
-      if (OB_FAIL(evict_until(entry.entry_bytes_))) {
-        if (ret == OB_BUF_NOT_ENOUGH) {
-          ATOMIC_INC(&stats_.put_skip_cap_cnt_);
-          return OB_BUF_NOT_ENOUGH;
-        }
-        LOG_WARN("failed to evict", K(ret), K(entry.entry_bytes_));
-      } else if (OB_ISNULL(stored = OB_NEW(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
+      entry.index_epoch_ = cur_epoch;
+      const int cap_ret = ensure_ledger_room_locked_(cid, entry.entry_bytes_, incoming_score);
+      if (cap_ret == OB_BUF_NOT_ENOUGH) {
+        ATOMIC_INC(&stats_.put_skip_cap_cnt_);
+        return OB_BUF_NOT_ENOUGH;
+      } else if (OB_FAIL(cap_ret)) {
+        return cap_ret;
+      }
+      // Drop ledger only; put_flat(overwrite) replaces KV. erase_key here races with concurrent get_flat.
+      (void)ledger_remove_locked_(cid, false, false);
+      char *flat_buf = nullptr;
+      int64_t flat_len = 0;
+      if (OB_FAIL(ivf_cid_flat_encode_entry(entry, flat_buf, flat_len))) {
+        LOG_WARN("failed to encode flat entry", K(ret), K(cid));
       } else {
-        stored->index_epoch_ = entry.index_epoch_;
-        stored->cid_ = entry.cid_;
-        stored->row_count_ = entry.row_count_;
-        stored->entry_bytes_ = entry.entry_bytes_;
-        stored->heat_ = entry.heat_;
-        stored->arena_ = entry.arena_;
-        entry.arena_ = nullptr;
-        if (OB_FAIL(stored->rows_.assign(entry.rows_))) {
-          LOG_WARN("failed to assign rows", K(ret));
-          OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, stored);
-        } else if (OB_FAIL(entry_map_.set_refactored(key, stored))) {
-          LOG_WARN("failed to set entry", K(ret));
-          OB_DELETE(ObIvfCidClusterEntry, IVF_CID_CLUSTER_CACHE_LABEL, stored);
+        ObIvfCidClusterKVKey kv_key(mgr_key_, cid);
+        if (OB_FAIL(get_ivf_cid_cluster_kv_cache().put_flat(kv_key, flat_buf, flat_len, true))) {
+          LOG_WARN("failed to put flat into kv cache", K(ret), K(cid));
         } else {
-          if (stored->heat_.access_cnt_ == 0) {
-            stored->heat_.access_cnt_ = 1;
+          if (entry.heat_.access_cnt_ == 0) {
+            entry.heat_.access_cnt_ = 1;
           }
-          stored->heat_.fill_cnt_++;
-          stored->heat_.last_access_us_ = ObTimeUtility::current_time();
-          total_bytes_ += stored->entry_bytes_;
-          ATOMIC_INC(&stats_.put_ok_cnt_);
-          ATOMIC_INC(&stats_.cur_entry_cnt_);
-          clear_probe_heat_locked_(entry.cid_);
+          entry.heat_.fill_cnt_++;
+          entry.heat_.last_access_us_ = ObTimeUtility::current_time();
+          ObIvfCidClusterHeat ledger_heat = entry.heat_;
+          ObIvfCidClusterHeat probe_heat;
+          {
+            lib::ObMutexGuard probe_guard(probe_heat_lock_);
+            if (OB_SUCCESS == probe_heat_map_.get_refactored(cid, probe_heat)) {
+              ledger_heat.access_cnt_ += probe_heat.access_cnt_;
+              ledger_heat.replay_cnt_ += probe_heat.replay_cnt_;
+            }
+          }
+          if (OB_FAIL(ledger_put_locked_(cid, entry.entry_bytes_, ledger_heat))) {
+            LOG_WARN("failed to update ledger", K(ret), K(cid));
+            (void)get_ivf_cid_cluster_kv_cache().erase_key(kv_key);
+          } else {
+            ATOMIC_INC(&stats_.put_ok_cnt_);
+            clear_probe_heat_locked_(cid);
+          }
         }
+        ivf_cid_flat_free_buf(flat_buf);
       }
-    }
-    if (OB_FAIL(ret) && ret != OB_SIZE_OVERFLOW) {
-      ATOMIC_INC(&stats_.put_fail_cnt_);
+      if (OB_FAIL(ret) && ret != OB_SIZE_OVERFLOW && ret != OB_BUF_NOT_ENOUGH && ret != OB_EAGAIN
+          && ret != OB_STATE_NOT_MATCH) {
+        ATOMIC_INC(&stats_.put_fail_cnt_);
+      }
     }
   }
   return ret;
@@ -1248,12 +1847,15 @@ int acquire_ivf_cid_cluster_cache(const ObIvfCidClusterCacheMgrKey &key, ObIvfCi
           }
         } else {
           cache = created;
+          // Mgr-map residency pin: keeps probe_heat / ledger across DAS iter release.
           cache->inc_ref();
         }
       } else {
         LOG_WARN("failed to get cache", K(ret));
       }
-    } else if (OB_NOT_NULL(cache)) {
+    }
+    // Per-holder pin (e.g. ObDASIvfCidVecCacheScanIter); released in release_ivf_cid_cluster_cache.
+    if (OB_SUCC(ret) && OB_NOT_NULL(cache)) {
       cache->inc_ref();
     }
   }
@@ -1303,7 +1905,9 @@ void release_ivf_cid_cluster_cache(ObIvfCidClusterCache *cache)
     {
       lib::ObMutexGuard guard(g_ivf_cid_cluster_cache_mgr_lock);
       const int64_t ref_after_dec = ATOMIC_SAF(&cache->ref_cnt_, 1);
-      if (ref_after_dec > 0) {
+      // ref_cnt_ == 1 after dec: only mgr-map residency remains — keep cache for cross-query warmup.
+      if (ref_after_dec > 1) {
+      } else if (ref_after_dec == 1) {
       } else if (ref_after_dec < 0) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("ivf cid cluster cache ref underflow", K(ret), K(ref_after_dec), K(cache->mgr_key_));

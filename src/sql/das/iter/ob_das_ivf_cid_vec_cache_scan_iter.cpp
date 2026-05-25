@@ -13,6 +13,8 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include "sql/das/iter/ob_das_ivf_cid_vec_cache_scan_iter.h"
+#include "sql/das/iter/ob_das_ivf_per_query_stats.h"
+#include "share/vector_index/ob_ivf_cid_cluster_kv_cache.h"
 #include "sql/engine/expr/ob_expr_util.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -50,7 +52,7 @@ ObDASIvfCidVecCacheScanIter::ObDASIvfCidVecCacheScanIter()
     cluster_cache_(nullptr),
     algo_(ObVectorIndexAlgorithmType::VIAT_MAX),
     cid_vec_ctdef_(nullptr),
-    mode_(ScanMode::PASSTHROUGH),
+    mode_(ScanMode::MISS),
     current_cid_(0),
     replay_entry_(nullptr),
     replay_idx_(0),
@@ -89,6 +91,23 @@ bool ObDASIvfCidVecCacheScanIter::skip_payload_lob_read(ObDASScanIter *cid_vec_i
   return is_row_materialized(cid_vec_iter, batch_idx);
 }
 
+bool ObDASIvfCidVecCacheScanIter::get_cached_payloads_l2_unit(
+    ObDASScanIter *cid_vec_iter,
+    bool &is_unit,
+    bool &known)
+{
+  known = false;
+  is_unit = false;
+  const ObDASIvfCidVecCacheScanIter *cache_iter = dynamic_cast<const ObDASIvfCidVecCacheScanIter *>(cid_vec_iter);
+  if (OB_ISNULL(cache_iter) || !cache_iter->cache_was_active_ || cache_iter->mode_ != ScanMode::REPLAY
+      || OB_ISNULL(cache_iter->replay_entry_)) {
+  } else if (cache_iter->replay_entry_->payloads_l2_unit_known_) {
+    known = true;
+    is_unit = cache_iter->replay_entry_->payloads_l2_unit_;
+  }
+  return known;
+}
+
 int ObDASIvfCidVecCacheScanIter::ensure_storage_scan()
 {
   int ret = OB_SUCCESS;
@@ -104,12 +123,12 @@ int ObDASIvfCidVecCacheScanIter::ensure_storage_scan()
 
 bool ObDASIvfCidVecCacheScanIter::scan_delegates_to_base_no_cache() const
 {
-  return mode_ == ScanMode::PASSTHROUGH || mode_ == ScanMode::STORAGE_ONLY;
+  return mode_ == ScanMode::MISS;
 }
 
 bool ObDASIvfCidVecCacheScanIter::needs_lightweight_cid_switch() const
 {
-  return mode_ == ScanMode::STORAGE_ONLY && building_cluster_.row_count_ <= 0
+  return mode_ == ScanMode::MISS && building_cluster_.row_count_ <= 0
       && OB_ISNULL(building_cluster_.arena_);
 }
 
@@ -125,9 +144,9 @@ int ObDASIvfCidVecCacheScanIter::delegate_base_do_table_scan()
 
 int ObDASIvfCidVecCacheScanIter::delegate_base_inner_get_next_row()
 {
-  const int64_t t0 = (mode_ == ScanMode::STORAGE_ONLY) ? ObTimeUtility::current_time() : 0;
+  const int64_t t0 = (mode_ == ScanMode::MISS) ? ObTimeUtility::current_time() : 0;
   int ret = ObDASScanIter::inner_get_next_row();
-  if (mode_ == ScanMode::STORAGE_ONLY) {
+  if (mode_ == ScanMode::MISS) {
     session_stats_.storage_fetch_us_ += ObTimeUtility::current_time() - t0;
   }
   return ret;
@@ -135,9 +154,9 @@ int ObDASIvfCidVecCacheScanIter::delegate_base_inner_get_next_row()
 
 int ObDASIvfCidVecCacheScanIter::delegate_base_inner_get_next_rows(int64_t &count, int64_t capacity)
 {
-  const int64_t t0 = (mode_ == ScanMode::STORAGE_ONLY) ? ObTimeUtility::current_time() : 0;
+  const int64_t t0 = (mode_ == ScanMode::MISS) ? ObTimeUtility::current_time() : 0;
   int ret = ObDASScanIter::inner_get_next_rows(count, capacity);
-  if (mode_ == ScanMode::STORAGE_ONLY) {
+  if (mode_ == ScanMode::MISS) {
     session_stats_.storage_fetch_us_ += ObTimeUtility::current_time() - t0;
   }
   return ret;
@@ -176,7 +195,7 @@ int ObDASIvfCidVecCacheScanIter::inner_init(ObDASIterParam &param)
     algo_ = p.algo_;
     cid_vec_ctdef_ = p.cid_vec_ctdef_;
     cache_was_active_ = OB_NOT_NULL(cluster_cache_) && share::is_ivf_cid_cluster_cache_enabled();
-    mode_ = cache_was_active_ ? ScanMode::FILL : ScanMode::PASSTHROUGH;
+    mode_ = ScanMode::MISS;
     current_cid_ = 0;
     replay_entry_ = nullptr;
     replay_idx_ = 0;
@@ -192,9 +211,17 @@ int ObDASIvfCidVecCacheScanIter::inner_init(ObDASIterParam &param)
   return ret;
 }
 
+void ObDASIvfCidVecCacheScanIter::finish_fill_leader_if_any()
+{
+  if (cid_fill_leader_ && OB_NOT_NULL(cluster_cache_)) {
+    cluster_cache_->finish_cid_fill(current_cid_);
+    cid_fill_leader_ = false;
+  }
+}
+
 void ObDASIvfCidVecCacheScanIter::log_session_stats_if_enabled() const
 {
-  if (!cache_was_active_) {
+  if (!cache_was_active_ || !ob_ivf_per_query_stats_emit_this_query()) {
     return;
   }
   const uint64_t index_epoch = OB_NOT_NULL(cluster_cache_) ? cluster_cache_->get_index_epoch() : 0;
@@ -204,8 +231,10 @@ void ObDASIvfCidVecCacheScanIter::log_session_stats_if_enabled() const
 
 void ObDASIvfCidVecCacheScanIter::maybe_log_progress_stats(uint64_t cid) const
 {
+  // Per-CID progress is opt-in (EVERY_N_CID>0). Default: query-granularity final only on owner thread.
   const int64_t every_n = share::ivf_cid_cluster_cache_stats_every_n_cid();
   if (every_n <= 0 || !cache_was_active_ || !share::is_ivf_cid_cluster_cache_stats_enabled()) {
+  } else if (!ob_ivf_per_query_stats_emit_this_query()) {
   } else if (session_stats_.cid_switch_cnt_ % every_n != 0) {
   } else {
     const char *mode_str = "unknown";
@@ -216,11 +245,8 @@ void ObDASIvfCidVecCacheScanIter::maybe_log_progress_stats(uint64_t cid) const
       case ScanMode::FILL:
         mode_str = "FILL";
         break;
-      case ScanMode::STORAGE_ONLY:
-        mode_str = "STORAGE_ONLY";
-        break;
-      case ScanMode::PASSTHROUGH:
-        mode_str = "PASSTHROUGH";
+      case ScanMode::MISS:
+        mode_str = "MISS";
         break;
       default:
         break;
@@ -318,30 +344,10 @@ int ObDASIvfCidVecCacheScanIter::parse_current_cid(uint64_t &cid)
 void ObDASIvfCidVecCacheScanIter::release_replay_entry()
 {
   if (OB_NOT_NULL(cluster_cache_) && OB_NOT_NULL(replay_entry_)) {
-    cluster_cache_->unpin_entry(replay_entry_);
+    cluster_cache_->release_session_entry(replay_entry_);
   }
   replay_entry_ = nullptr;
   replay_idx_ = 0;
-}
-
-int ObDASIvfCidVecCacheScanIter::try_switch_to_replay_after_put_conflict(uint64_t cid)
-{
-  int ret = OB_SUCCESS;
-  bool is_fill_leader = false;
-  release_replay_entry();
-  bool storage_only = false;
-  if (OB_FAIL(cluster_cache_->acquire_cid_cluster(
-          cid, replay_entry_, is_fill_leader, storage_only, &session_stats_))) {
-    LOG_WARN("failed to acquire cluster for replay after put conflict", K(ret), K(cid));
-  } else if (is_fill_leader || storage_only || OB_ISNULL(replay_entry_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected acquire after put conflict", K(ret), K(cid), K(is_fill_leader), K(storage_only), KP(replay_entry_));
-  } else {
-    mode_ = ScanMode::REPLAY;
-    replay_idx_ = 0;
-    session_stats_.replay_cid_cnt_++;
-  }
-  return ret;
 }
 
 int ObDASIvfCidVecCacheScanIter::flush_building_cluster()
@@ -353,14 +359,7 @@ int ObDASIvfCidVecCacheScanIter::flush_building_cluster()
   } else {
     const int64_t rows = building_cluster_.row_count_;
     if (OB_FAIL(cluster_cache_->put(building_cluster_))) {
-      if (ret == OB_EAGAIN) {
-        session_stats_.put_cid_skip_pinned_cnt_++;
-        discard_building_cluster();
-        if (OB_FAIL(try_switch_to_replay_after_put_conflict(fill_cid))) {
-          LOG_WARN("failed to switch to replay after put skip", K(ret), K(fill_cid));
-        }
-        ret = OB_SUCCESS;
-      } else if (ret == OB_BUF_NOT_ENOUGH) {
+      if (ret == OB_BUF_NOT_ENOUGH || ret == OB_STATE_NOT_MATCH) {
         ret = OB_SUCCESS;
         discard_building_cluster();
       } else {
@@ -371,6 +370,7 @@ int ObDASIvfCidVecCacheScanIter::flush_building_cluster()
     } else {
       session_stats_.put_cid_ok_cnt_++;
       session_stats_.put_rows_total_ += rows;
+      cluster_cache_->notify_refresh_put_done(fill_cid);
       discard_building_cluster();
     }
   }
@@ -396,24 +396,22 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
   if (OB_ISNULL(cluster_cache_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    bool is_fill_leader = false;
-    bool storage_only = false;
+    share::ObIvfCidClusterLookupResult lookup_result = share::ObIvfCidClusterLookupResult::MISS;
     const int64_t acquire_beg_us = ObTimeUtility::current_time();
-    if (OB_FAIL(cluster_cache_->acquire_cid_cluster(
-            new_cid, replay_entry_, is_fill_leader, storage_only, &session_stats_))) {
-      LOG_WARN("failed to acquire cid cluster", K(ret), K(new_cid));
+    if (OB_FAIL(cluster_cache_->lookup_cid(new_cid, replay_entry_, lookup_result, &session_stats_))) {
+      LOG_WARN("failed to lookup cid cluster", K(ret), K(new_cid));
     }
     session_stats_.acquire_us_ += ObTimeUtility::current_time() - acquire_beg_us;
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(replay_entry_)) {
+    } else if (lookup_result == share::ObIvfCidClusterLookupResult::HIT) {
       revert_storage_scan_iter_if_any();
       mode_ = ScanMode::REPLAY;
+      replay_idx_ = 0;
       session_stats_.replay_cid_cnt_++;
-    } else if (storage_only) {
-      // Cache miss / not admitted: use base ObDASScanIter path (same as ENABLED=0).
-      mode_ = ScanMode::STORAGE_ONLY;
+    } else if (lookup_result == share::ObIvfCidClusterLookupResult::MISS) {
+      mode_ = ScanMode::MISS;
       session_stats_.storage_only_cid_cnt_++;
-    } else if (is_fill_leader) {
+    } else if (lookup_result == share::ObIvfCidClusterLookupResult::FILL_LEADER) {
       mode_ = ScanMode::FILL;
       cid_fill_leader_ = true;
       session_stats_.fill_cid_cnt_++;
@@ -431,7 +429,7 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
       }
     } else {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected acquire result", K(ret), K(new_cid));
+      LOG_WARN("unexpected lookup result", K(ret), K(new_cid), K(static_cast<int>(lookup_result)));
     }
   }
   return ret;
@@ -440,7 +438,7 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
 int ObDASIvfCidVecCacheScanIter::on_cid_switch(uint64_t new_cid)
 {
   int ret = OB_SUCCESS;
-  if (mode_ == ScanMode::PASSTHROUGH) {
+  if (!cache_was_active_) {
   } else if (!needs_lightweight_cid_switch() && OB_FAIL(flush_building_cluster())) {
     LOG_WARN("failed to flush building cluster", K(ret));
   } else {
@@ -460,7 +458,7 @@ int ObDASIvfCidVecCacheScanIter::on_cid_switch(uint64_t new_cid)
 int ObDASIvfCidVecCacheScanIter::rescan()
 {
   int ret = OB_SUCCESS;
-  if (mode_ == ScanMode::PASSTHROUGH) {
+  if (!cache_was_active_) {
     ret = delegate_base_rescan();
   } else {
     uint64_t cid = 0;
@@ -468,10 +466,12 @@ int ObDASIvfCidVecCacheScanIter::rescan()
       LOG_WARN("failed to parse cid", K(ret));
     } else if (OB_FAIL(on_cid_switch(cid))) {
       LOG_WARN("failed on cid switch", K(ret), K(cid));
+      finish_fill_leader_if_any();
     } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
       ret = ensure_storage_scan();
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to ensure storage scan", K(ret));
+        finish_fill_leader_if_any();
       }
     }
   }
@@ -481,7 +481,7 @@ int ObDASIvfCidVecCacheScanIter::rescan()
 int ObDASIvfCidVecCacheScanIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
-  if (mode_ == ScanMode::PASSTHROUGH) {
+  if (!cache_was_active_) {
     ret = delegate_base_do_table_scan();
   } else {
     uint64_t cid = 0;
@@ -489,10 +489,12 @@ int ObDASIvfCidVecCacheScanIter::do_table_scan()
       LOG_WARN("failed to parse cid", K(ret));
     } else if (OB_FAIL(on_cid_switch(cid))) {
       LOG_WARN("failed on cid switch", K(ret), K(cid));
+      finish_fill_leader_if_any();
     } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
       ret = ensure_storage_scan();
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to ensure storage scan", K(ret));
+        finish_fill_leader_if_any();
       }
     }
   }
@@ -575,6 +577,14 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
           building_cluster_.row_count_++;
           building_cluster_.entry_bytes_ += row.payload_len_ + ob_ivf_cid_rowkey_storage_bytes(obj_buf, rk);
           session_stats_.fill_row_cnt_++;
+          if (building_cluster_.row_count_ == 1 && !building_cluster_.payloads_l2_unit_known_) {
+            bool is_unit = false;
+            bool probe_known = false;
+            if (share::ivf_cid_probe_payloads_l2_unit(building_cluster_, is_unit, probe_known) && probe_known) {
+              building_cluster_.payloads_l2_unit_known_ = true;
+              building_cluster_.payloads_l2_unit_ = is_unit;
+            }
+          }
         }
       }
     }

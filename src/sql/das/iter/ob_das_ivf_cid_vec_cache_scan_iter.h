@@ -43,6 +43,8 @@ public:
   static bool is_row_materialized(ObDASScanIter *cid_vec_iter, int64_t batch_idx = 0);
   /// REPLAY / FILL rows already have expanded payload in datum; do not read_real_string_data as LOB.
   static bool skip_payload_lob_read(ObDASScanIter *cid_vec_iter, int64_t batch_idx = 0);
+  /// REPLAY only: FILL recorded whether cluster payloads are already L2 unit (from flat header).
+  static bool get_cached_payloads_l2_unit(ObDASScanIter *cid_vec_iter, bool &is_unit, bool &known);
   /// REPLAY serves rows from cache memory; no storage ObTableScanIterator (output_result_iter is null).
   static bool cid_vec_skips_storage_output_result_iter(ObDASScanIter *cid_vec_iter);
   static ObDASIvfCidVecCacheScanIter *get_active_iter() { return active_iter_; }
@@ -61,13 +63,12 @@ protected:
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
 
 private:
-  enum class ScanMode { FILL, REPLAY, STORAGE_ONLY, PASSTHROUGH };
+  enum class ScanMode { REPLAY, FILL, MISS };
 
   int on_cid_switch(uint64_t new_cid);
   int acquire_cid_and_set_mode(uint64_t new_cid);
   int parse_current_cid(uint64_t &cid);
   int flush_building_cluster();
-  int try_switch_to_replay_after_put_conflict(uint64_t cid);
   void clear_materialized_batch();
   void mark_materialized_batch(int64_t count);
   void discard_building_cluster();
@@ -77,9 +78,9 @@ private:
   int replay_rows(int64_t &count, int64_t capacity);
   share::ObIvfCidClusterPayloadType payload_type() const;
   int materialize_row_to_eval(const share::ObIvfCidClusterRow &row, int64_t batch_idx);
-  /// Open storage scan if result_ is null (after REPLAY), else rescan. Used by FILL and STORAGE_ONLY.
+  /// Open storage scan if result_ is null (after REPLAY), else rescan. Used by FILL and MISS.
   int ensure_storage_scan();
-  /// STORAGE_ONLY / PASSTHROUGH: delegate to ObDASScanIter (same as ENABLED=0 scan path).
+  /// MISS: delegate to ObDASScanIter (same as ENABLED=0 scan path).
   bool scan_delegates_to_base_no_cache() const;
   bool needs_lightweight_cid_switch() const;
   int delegate_base_rescan();
@@ -88,6 +89,7 @@ private:
   int delegate_base_inner_get_next_rows(int64_t &count, int64_t capacity);
   void log_session_stats_if_enabled() const;
   void maybe_log_progress_stats(uint64_t cid) const;
+  void finish_fill_leader_if_any();
 
   share::ObIvfCidClusterCache *cluster_cache_;
   ObVectorIndexAlgorithmType algo_;

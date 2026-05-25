@@ -310,12 +310,10 @@ class ObIvfAadaptiveCtx
 
 /// IVF scan latency breakdown (microseconds).
 /// Enable with OB_IVF_LATENCY_BREAKDOWN=1 on observer.
-/// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N=N (optional): only one observer worker thread (owner, pinned by
-/// first IVF scan after idle or startup) counts queries; while (indexed row estimate, dim, nlist) stay unchanged,
-/// emit every N-th IVF process_ivf_scan on that thread (N defaults to 4). The first such scan after a
-/// dataset-key change counts as query 1 and is emitted. Other threads skip breakdown (no timers / no log).
-/// If wall time since the previous IVF scan exceeds ~60s (benchmark idle), the owner pin resets so the next
-/// scan can claim ownership again.
+/// Per-query stats (latency breakdown + cache session final) use a single pinned owner worker thread;
+/// see ob_das_ivf_per_query_stats.h. Other threads skip timers and file/observer stats logs.
+/// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N=N (optional): on owner only, emit every N-th query (default 0 = every query).
+/// Idle ~60s resets owner pin so the next scan can claim ownership again.
 /// Additionally appends the same metrics (one line per sample) to per-thread files under
 /// ${HOME}/log/ob_ivf_latency_breakdown.n<rows>_d<dim>_c<nlist>.<tid>.log
 /// (Observer process unix user's HOME; rows/dim/nlist from planner stats / index params), or to

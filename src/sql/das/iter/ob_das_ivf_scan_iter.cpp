@@ -13,6 +13,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/iter/ob_das_ivf_scan_iter.h"
 #include "sql/das/iter/ob_das_ivf_cid_vec_cache_scan_iter.h"
+#include "sql/das/iter/ob_das_ivf_per_query_stats.h"
 #include "lib/time/ob_time_utility.h"
 #include "sql/das/ob_das_scan_op.h"
 #include "storage/tx_storage/ob_access_service.h"
@@ -47,12 +48,6 @@ namespace sql
 
 namespace {
 
-OB_INLINE bool ob_ivf_latency_breakdown_enabled()
-{
-  const char *const e = ::getenv("OB_IVF_LATENCY_BREAKDOWN");
-  return e != nullptr && e[0] == '1';
-}
-
 /// Remaining ``fine_wall`` not covered by the cid_vector fine splits + fine_load/compute + heap finalize.
 OB_INLINE int64_t ob_ivf_latency_breakdown_fine_cv_untracked_us(const ObIvfLatencyBreakdown &lat)
 {
@@ -68,69 +63,6 @@ OB_INLINE int64_t ob_ivf_latency_breakdown_fine_cv_untracked_us(const ObIvfLaten
       + lat.fine_heap_finalize_us_;
   const int64_t residual = lat.fine_wall_us_ - accounted;
   return residual > 0 ? residual : 0;
-}
-
-constexpr int64_t IVF_LAT_BREAKDOWN_IDLE_NEW_ROUND_GAP_US = 60LL * 1000000LL;
-
-/// IVF process_ivf_scan wall-time (last start); idle gap clears owner thread pin.
-static int64_t g_ivf_lat_breakdown_last_ivf_scan_us = 0;
-
-/// Only GETTID()==owner_tid runs SAMPLE_EVERY_N logic; other threads skip breakdown entirely.
-static int64_t g_ivf_lat_breakdown_owner_tid = 0;
-
-OB_INLINE void ob_ivf_latency_breakdown_on_new_ivf_scan_start()
-{
-  const int64_t now_us = ObTimeUtility::current_time();
-  const int64_t prev_us = ATOMIC_LOAD(&g_ivf_lat_breakdown_last_ivf_scan_us);
-  if (prev_us != 0LL && (now_us - prev_us) > IVF_LAT_BREAKDOWN_IDLE_NEW_ROUND_GAP_US) {
-    ATOMIC_STORE(&g_ivf_lat_breakdown_owner_tid, 0);
-  }
-  ATOMIC_STORE(&g_ivf_lat_breakdown_last_ivf_scan_us, now_us);
-}
-
-constexpr int64_t IVF_LAT_BREAKDOWN_SAMPLE_EVERY_N_DEFAULT = 4;
-
-/// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N: on the owner thread only, emit one breakdown every N IVF scans
-/// while dataset key (row_count, dim, nlist) is unchanged. Default 4; invalid/unset uses default; <=0 means emit every scan.
-OB_INLINE int64_t ob_ivf_latency_breakdown_sample_every_n_env()
-{
-  const char *const e = ::getenv("OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N");
-  if (e == nullptr || e[0] == '\0') {
-    return IVF_LAT_BREAKDOWN_SAMPLE_EVERY_N_DEFAULT;
-  }
-  char *endptr = nullptr;
-  const long long parsed = std::strtoll(e, &endptr, 10);
-  if (endptr == e) {
-    return IVF_LAT_BREAKDOWN_SAMPLE_EVERY_N_DEFAULT;
-  }
-  return static_cast<int64_t>(parsed);
-}
-
-/// Owner-thread-only sequence for (dataset_rows, dim, nlist_centers). Reset when any component changes.
-OB_INLINE bool ob_ivf_latency_breakdown_should_sample_for_dataset(
-    const int64_t dataset_rows,
-    const int64_t dim,
-    const int64_t nlist_centers,
-    const int64_t every_n)
-{
-  thread_local bool tls_ds_inited = false;
-  thread_local int64_t tls_ds_rows = 0;
-  thread_local int64_t tls_ds_dim = 0;
-  thread_local int64_t tls_ds_nlist = 0;
-  thread_local int64_t tls_query_seq = 0;
-
-  if (!tls_ds_inited || dataset_rows != tls_ds_rows || dim != tls_ds_dim || nlist_centers != tls_ds_nlist) {
-    tls_ds_inited = true;
-    tls_ds_rows = dataset_rows;
-    tls_ds_dim = dim;
-    tls_ds_nlist = nlist_centers;
-    tls_query_seq = 0;
-  }
-  ++tls_query_seq;
-  if (every_n <= 0) {
-    return true;
-  }
-  return ((tls_query_seq - 1) % every_n) == 0;
 }
 
 OB_INLINE int ob_ivf_lat_create_parent_dirs_for_file(const char *file_path)
@@ -1175,11 +1107,6 @@ void ObDASIvfBaseScanIter::ivf_lat_log(const bool is_vectorized) const
   if (OB_NOT_NULL(cid_vec_iter_)) {
     (void)ob_das_ivf_try_export_cid_cluster_cache_snapshot(cid_vec_iter_, cache_snap);
   }
-  if (share::is_ivf_cid_cluster_cache_stats_enabled()) {
-    share::log_ivf_cid_cluster_cache_snapshot_to_observer(cache_snap);
-    share::ob_ivf_cid_cluster_cache_write_user_log_file(
-        cache_snap, adaptive_ctx_.row_count_, dim_, vec_index_param_.nlist_);
-  }
   ob_ivf_latency_breakdown_append_user_log(is_vectorized,
       ivf_lat_,
       misc_us,
@@ -1198,30 +1125,9 @@ int ObDASIvfBaseScanIter::process_ivf_scan(bool is_vectorized)
 {
   int ret = OB_SUCCESS;
   ivf_lat_reset();
-  ob_ivf_latency_breakdown_on_new_ivf_scan_start();
-  {
-    const bool env_on = ob_ivf_latency_breakdown_enabled();
-    if (!env_on) {
-      ivf_lat_.enabled_ = false;
-    } else {
-      const int64_t tid = GETTID();
-      int64_t owner_tid = ATOMIC_LOAD(&g_ivf_lat_breakdown_owner_tid);
-      if (owner_tid == 0) {
-        if (ATOMIC_BCAS(&g_ivf_lat_breakdown_owner_tid, 0, tid)) {
-          owner_tid = tid;
-        } else {
-          owner_tid = ATOMIC_LOAD(&g_ivf_lat_breakdown_owner_tid);
-        }
-      }
-      if (owner_tid != tid) {
-        ivf_lat_.enabled_ = false;
-      } else {
-        const int64_t every_n = ob_ivf_latency_breakdown_sample_every_n_env();
-        ivf_lat_.enabled_ = ob_ivf_latency_breakdown_should_sample_for_dataset(
-            adaptive_ctx_.row_count_, dim_, vec_index_param_.nlist_, every_n);
-      }
-    }
-  }
+  const bool emit_per_query = ob_ivf_per_query_stats_begin_query(
+      adaptive_ctx_.row_count_, dim_, vec_index_param_.nlist_);
+  ivf_lat_.enabled_ = emit_per_query && ob_ivf_latency_breakdown_enabled();
   const int64_t t_ivf_all_start = ivf_lat_.enabled_ ? ObTimeUtility::current_time() : 0;
   const int64_t t_das_body_start = ivf_lat_.enabled_ ? ObTimeUtility::current_time() : 0;
 
@@ -2562,6 +2468,14 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
   if (OB_FAIL(ret)) {
     return ret;
   }
+  if (need_norm_) {
+    bool cache_unit = false;
+    bool cache_known = false;
+    if (ObDASIvfCidVecCacheScanIter::get_cached_payloads_l2_unit(cid_vec_iter_, cache_unit, cache_known) && cache_known) {
+      cid_vec_need_norm = !cache_unit;
+      is_first_vec = false;
+    }
+  }
   if (is_vectorized) {
     int64_t cid_vec_batch_count = get_cid_vec_batch_count();
     bool index_end = false;
@@ -2665,8 +2579,22 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
             vec_row_load_charged = true;
           }
           const int64_t t_vec_compute_beg = ivf_lat_.enabled_ ? ObTimeUtility::current_time() : 0;
+          const bool cache_zero_copy = ObDASIvfCidVecCacheScanIter::skip_payload_lob_read(cid_vec_iter_, i);
+          const bool will_norm = is_first_vec || cid_vec_need_norm;
+          const int64_t dim_bytes = vec_aux_ctdef_->dim_ * static_cast<int64_t>(sizeof(float));
+          char *norm_scratch = nullptr;
+          if (cache_zero_copy && will_norm && vec.length() >= dim_bytes
+              && OB_ISNULL(norm_scratch = static_cast<char *>(
+                      mem_context_->get_arena_allocator().alloc(dim_bytes)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (cache_zero_copy && will_norm && OB_NOT_NULL(norm_scratch)) {
+            MEMCPY(norm_scratch, vec.ptr(), dim_bytes);
+            cid_datum[i].set_string(norm_scratch, dim_bytes);
+            vec = cid_datum[i].get_string();
+          }
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
-          if (is_first_vec) {
+          if (OB_FAIL(ret)) {
+          } else if (is_first_vec) {
             if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
                     vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr()),
                     &cid_vec_need_norm))) {
@@ -2819,8 +2747,24 @@ int ObDASIvfScanIter::get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_v
                 ret);
           }
         } else if (!latent_sq8_heap && std::is_same<T, float>::value && need_norm_) {
+          const bool cache_zero_copy = ObDASIvfCidVecCacheScanIter::skip_payload_lob_read(cid_vec_iter_, 0);
+          const bool will_norm = is_first_vec || cid_vec_need_norm;
+          const int64_t dim_bytes = vec_aux_ctdef_->dim_ * static_cast<int64_t>(sizeof(float));
+          char *norm_scratch = nullptr;
+          if (cache_zero_copy && will_norm && vec.length() >= dim_bytes
+              && OB_ISNULL(norm_scratch = static_cast<char *>(
+                      mem_context_->get_arena_allocator().alloc(dim_bytes)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (cache_zero_copy && will_norm && OB_NOT_NULL(norm_scratch)) {
+            MEMCPY(norm_scratch, vec.ptr(), dim_bytes);
+            ObExpr *vec_expr = cid_vec_ctdef->result_output_[1];
+            ObEvalCtx *eval_ctx = cid_vec_rtdef->eval_ctx_;
+            vec_expr->locate_datum_for_write(*eval_ctx).set_string(norm_scratch, dim_bytes);
+            vec = vec_expr->locate_expr_datum(*eval_ctx).get_string();
+          }
           // If the first vec needs do_norm, it means that the vec in the cid_vector table is not normalized.
-          if (is_first_vec) {
+          if (OB_FAIL(ret)) {
+          } else if (is_first_vec) {
             if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
                     vec_aux_ctdef_->dim_, reinterpret_cast<float *>(vec.ptr()), reinterpret_cast<float *>(vec.ptr()),
                     &cid_vec_need_norm))) {
