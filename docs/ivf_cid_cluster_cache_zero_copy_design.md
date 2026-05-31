@@ -81,7 +81,7 @@ epoch++；清 fill gate；对有 `cached_bytes>0` 的 CID 做 `ledger_remove_`�
 |------|------|------|
 | `OB_IVF_CID_CLUSTER_CACHE_FILL_MIN_PROBE_ACCESS` | 5 | 允许 FILL 的最小 probe 次数 |
 | `OB_IVF_CID_CLUSTER_CACHE_MAX_CID` | 4096 | `cid_states_` 数组长度上界 |
-| max_mb（init 参数 / 配置） | 128 | `ledger_bytes_total` 上限 |
+| max_mb（init 参数 / 配置） | 10240（10GB） | `ledger_bytes_total` 上限 |
 
 ---
 

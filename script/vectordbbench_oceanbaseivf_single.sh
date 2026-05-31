@@ -22,7 +22,10 @@
 #   VECTORDDBENCH_ROOT   VectorDBBench 源码根目录（用于 PYTHONPATH）
 #                        未设置时自动在若干候选路径中选取「含 vectordb_bench/cli/cli.py」的完整仓库
 #                        （test/VectorDBBench 可能不完整，会跳过并选用 ~/VectorDBBench 等）
-#   INDEX_TYPE           默认 ivf_flat（可选 ivf_sq8、ivf_pq）
+#   INDEX_TYPE           默认 ivf_flat（可选 ivf_sq8、ivf_pq）；export INDEX_TYPE=ivf_flat 可切回 FLAT
+#   IVF_PQ_SUBDIM        仅 ivf_pq：每段 sub-vector 维数，默认 8 → m=dim/subdim（1536D→m=192，768D→m=96）
+#   IVF_PQ_M / IVF_M     仅 ivf_pq：显式指定 m（覆盖 IVF_PQ_SUBDIM 推导；须整除 dim）
+#   IVF_PQ_NBITS / IVF_NBITS  仅 ivf_pq：PQ 码本位数，默认 8（OceanBase 支持 1–24）
 #   DATASET_LOCAL_DIR    数据集根目录，默认 ${VEC_DATA_ROOT:-/data/zhuxueying.zxy/vec_data}
 #   VDB_NUM_CONCURRENCY  默认 80（逗号列表会传给 --num-concurrency）
 #   VDB_SKIP_DROP_OLD=1  等价 --skip-drop-old（复用已有表结构，不 DROP）
@@ -88,9 +91,75 @@ fi
 OB_HOST="${OB_HOST:-127.0.0.1}"
 # 未设置 OB_PASSWORD 时保持为空（真正无密码），勿再默认成空格以免 1045
 OB_PASSWORD="${OB_PASSWORD:-}"
-INDEX_TYPE="${INDEX_TYPE:-ivf_flat}"
+
+normalize_index_type() {
+  local t="${1,,}"
+  case "${t}" in
+    ivf_flat | ivfflat) echo "IVF_FLAT" ;;
+    ivf_sq8 | ivfsq8) echo "IVF_SQ8" ;;
+    ivf_pq | ivfpq) echo "IVF_PQ" ;;
+    ivf_*) echo "${1^^}" ;;
+    *) echo "${1}" ;;
+  esac
+}
+
+case_type_vector_dim() {
+  local ct="$1"
+  if [[ "${ct}" =~ ([0-9]+)[dD] ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+ivf_pq_m_for_subdim() {
+  local dim="$1"
+  local subdim="$2"
+  if [[ -z "${dim}" ]] || [[ ! "${dim}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: cannot derive IVF_PQ m from CASE_TYPE=${CASE_TYPE:-}; set IVF_PQ_M or use Performance*D* CaseType" >&2
+    return 1
+  fi
+  if [[ ! "${subdim}" =~ ^[0-9]+$ ]] || (( subdim < 1 )); then
+    echo "ERROR: IVF_PQ_SUBDIM must be a positive integer, got: ${subdim}" >&2
+    return 1
+  fi
+  if (( dim % subdim != 0 || dim < subdim )); then
+    echo "ERROR: dim=${dim} not divisible by IVF_PQ_SUBDIM=${subdim} (need m=dim/subdim integer)" >&2
+    return 1
+  fi
+  echo $((dim / subdim))
+}
+
+INDEX_TYPE="$(normalize_index_type "${INDEX_TYPE:-ivf_flat}")"
 DATASET_LOCAL_DIR="${DATASET_LOCAL_DIR:-${VEC_DATA_ROOT:-/data/zhuxueying.zxy/vec_data}}"
 export DATASET_LOCAL_DIR
+
+IVF_PQ_EXTRA_ARGS=()
+if [[ "${INDEX_TYPE}" == "IVF_PQ" ]]; then
+  _pq_dim="$(case_type_vector_dim "${CASE_TYPE:-}" 2>/dev/null || true)"
+  IVF_PQ_SUBDIM="${IVF_PQ_SUBDIM:-8}"
+  IVF_PQ_M="${IVF_PQ_M:-${IVF_M:-}}"
+  if [[ -z "${IVF_PQ_M}" ]]; then
+    IVF_PQ_M="$(ivf_pq_m_for_subdim "${_pq_dim}" "${IVF_PQ_SUBDIM}")" || exit 1
+  fi
+  IVF_PQ_NBITS="${IVF_PQ_NBITS:-${IVF_NBITS:-8}}"
+  if [[ -n "${_pq_dim}" ]] && (( _pq_dim % IVF_PQ_M == 0 )); then
+    IVF_PQ_SUBDIM=$((_pq_dim / IVF_PQ_M))
+  fi
+  if [[ ! "${IVF_PQ_M}" =~ ^[0-9]+$ ]] || (( IVF_PQ_M < 1 )); then
+    echo "ERROR: IVF_PQ_M must be a positive integer, got: ${IVF_PQ_M}" >&2
+    exit 1
+  fi
+  if [[ -n "${_pq_dim}" ]] && (( _pq_dim % IVF_PQ_M != 0 || _pq_dim < IVF_PQ_M )); then
+    echo "ERROR: IVF_PQ_M=${IVF_PQ_M} invalid for dim=${_pq_dim} (must divide dim and be <= dim)" >&2
+    exit 1
+  fi
+  if [[ ! "${IVF_PQ_NBITS}" =~ ^[0-9]+$ ]] || (( IVF_PQ_NBITS < 1 || IVF_PQ_NBITS > 24 )); then
+    echo "ERROR: IVF_PQ_NBITS must be in [1,24], got: ${IVF_PQ_NBITS}" >&2
+    exit 1
+  fi
+  IVF_PQ_EXTRA_ARGS=(--m "${IVF_PQ_M}" --nbits "${IVF_PQ_NBITS}")
+fi
 
 TABLE_NAME="${OB_TABLE_NAME:-${VDB_TABLE_NAME:-items}}"
 
@@ -116,7 +185,10 @@ REBUILD_ARGS=()
 
 echo "### vectordbbench_oceanbaseivf_single $(date -Iseconds)"
 echo "### PYTHONPATH=${VECTORDDBENCH_ROOT}"
-echo "### CASE_TYPE=${CASE_TYPE} NLIST=${NLIST} SAMPLE_PER_NLIST=${SAMPLE_PER_NLIST} IVF_NPROBES=${IVF_NPROBES}"
+echo "### CASE_TYPE=${CASE_TYPE} NLIST=${NLIST} SAMPLE_PER_NLIST=${SAMPLE_PER_NLIST} IVF_NPROBES=${IVF_NPROBES} INDEX_TYPE=${INDEX_TYPE}"
+if [[ "${INDEX_TYPE}" == "IVF_PQ" ]]; then
+  echo "### IVF_PQ dim=${_pq_dim:-?} subdim=${IVF_PQ_SUBDIM} m=${IVF_PQ_M} nbits=${IVF_PQ_NBITS}"
+fi
 echo "### VDB_TASK_LABEL=${VDB_TASK_LABEL}"
 echo "### OB ${OB_USER}@${OB_HOST}:${OB_PORT}/${OB_DATABASE} table=${TABLE_NAME}"
 echo "### stages: ${DROP_ARGS[*]} ${LOAD_ARGS[*]} ${REBUILD_ARGS[*]} ${SER_ARGS[*]} ${CONC_ARGS[*]}"
@@ -139,5 +211,6 @@ exec "${PYTHON}" -m vectordb_bench.cli.vectordbbench oceanbaseivf \
   --nlist "${NLIST}" \
   --sample_per_nlist "${SAMPLE_PER_NLIST}" \
   --ivf_nprobes "${IVF_NPROBES}" \
+  "${IVF_PQ_EXTRA_ARGS[@]}" \
   --num-concurrency "${NUM_CONCURRENCY_STR}" \
   "$@"

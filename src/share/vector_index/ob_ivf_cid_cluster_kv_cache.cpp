@@ -212,8 +212,22 @@ bool ivf_cid_probe_payloads_l2_unit(const ObIvfCidClusterEntry &entry, bool &is_
 static const int64_t IVF_CID_FLAT_FILL_INITIAL_DATA_CAP = 64 * 1024;
 
 ObIvfCidFlatFillState::ObIvfCidFlatFillState()
-  : data_buf_(nullptr), data_cap_(0), data_len_(0), payload_off_(), payload_len_(), rk_off_(), rk_len_()
+  : data_buf_(nullptr),
+    data_cap_(0),
+    data_len_(0),
+    payload_type_(IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT),
+    payload_off_(),
+    payload_len_(),
+    rk_off_(),
+    rk_len_()
 {}
+
+static bool ivf_cid_flat_payload_type_supported_(const ObIvfCidClusterPayloadType payload_type)
+{
+  return payload_type == IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT
+      || payload_type == IVF_CID_CLUSTER_PAYLOAD_SQ8_U8
+      || payload_type == IVF_CID_CLUSTER_PAYLOAD_PQ_IDS;
+}
 
 static int ivf_cid_flat_fill_ensure_cap_(ObIvfCidFlatFillState *state, const int64_t need_bytes)
 {
@@ -299,9 +313,14 @@ int ivf_cid_flat_fill_append_row(ObIvfCidFlatFillState *state,
     const common::ObRowkey &rowkey)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(state) || payload_type != IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT) {
+  if (OB_ISNULL(state) || !ivf_cid_flat_payload_type_supported_(payload_type)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (state->payload_off_.count() > 0 && state->payload_type_ != payload_type) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    if (state->payload_off_.count() == 0) {
+      state->payload_type_ = payload_type;
+    }
     const int64_t rk_sz = ObTableSerialUtil::get_serialize_size(rowkey);
     if (OB_FAIL(ivf_cid_flat_fill_ensure_cap_(state, payload_len + rk_sz))) {
       LOG_WARN("failed to grow flat fill buffer", K(ret), K(payload_len), K(rk_sz));
@@ -366,9 +385,14 @@ int ivf_cid_flat_fill_finalize(const ObIvfCidClusterEntry &entry,
       hdr->fill_cnt_ = entry.heat_.fill_cnt_;
       hdr->last_access_us_ = entry.heat_.last_access_us_;
       hdr->flat_buf_len_ = total;
-      hdr->payload_type_ = static_cast<uint8_t>(IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT);
-      hdr->reserved_[0] = entry.payloads_l2_unit_known_ ? 1 : 0;
-      hdr->reserved_[1] = (entry.payloads_l2_unit_known_ && entry.payloads_l2_unit_) ? 1 : 0;
+      hdr->payload_type_ = static_cast<uint8_t>(state->payload_type_);
+      if (state->payload_type_ == IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT) {
+        hdr->reserved_[0] = entry.payloads_l2_unit_known_ ? 1 : 0;
+        hdr->reserved_[1] = (entry.payloads_l2_unit_known_ && entry.payloads_l2_unit_) ? 1 : 0;
+      } else {
+        hdr->reserved_[0] = 0;
+        hdr->reserved_[1] = 0;
+      }
       char *payload_off_tbl = buf + sizeof(ObIvfCidFlatHeader);
       char *payload_len_tbl = payload_off_tbl + row_count * sizeof(int64_t);
       char *rowkey_off_tbl = payload_len_tbl + row_count * sizeof(int32_t);
@@ -561,6 +585,44 @@ int ivf_cid_flat_open_replay_entry(const char *flat_buf,
         entry->payloads_l2_unit_ = (hdr->reserved_[1] != 0);
       }
       out_entry = entry;
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_reopen_replay_entry(const char *flat_buf, const int64_t flat_len, ObIvfCidClusterEntry &entry)
+{
+  int ret = OB_SUCCESS;
+  const ObIvfCidFlatHeader *hdr = nullptr;
+  const int64_t *payload_off_tbl = nullptr;
+  const int32_t *payload_len_tbl = nullptr;
+  const int64_t *rowkey_off_tbl = nullptr;
+  const int32_t *rowkey_len_tbl = nullptr;
+  if (OB_FAIL(ivf_cid_flat_header_tables_(flat_buf, flat_len, hdr, payload_off_tbl, payload_len_tbl,
+          rowkey_off_tbl, rowkey_len_tbl))) {
+  } else {
+    UNUSED(payload_off_tbl);
+    UNUSED(payload_len_tbl);
+    UNUSED(rowkey_off_tbl);
+    UNUSED(rowkey_len_tbl);
+    entry.index_epoch_ = hdr->index_epoch_;
+    entry.cid_ = hdr->cid_;
+    entry.row_count_ = hdr->row_count_;
+    entry.entry_bytes_ = hdr->entry_bytes_;
+    entry.heat_.access_cnt_ = hdr->access_cnt_;
+    entry.heat_.replay_cnt_ = hdr->replay_cnt_;
+    entry.heat_.fill_cnt_ = hdr->fill_cnt_;
+    entry.heat_.last_access_us_ = hdr->last_access_us_;
+    entry.arena_ = nullptr;
+    entry.kv_flat_buf_ = flat_buf;
+    entry.rowkey_objs_ = nullptr;
+    entry.flat_fill_ = nullptr;
+    if (hdr->reserved_[0] != 0) {
+      entry.payloads_l2_unit_known_ = true;
+      entry.payloads_l2_unit_ = (hdr->reserved_[1] != 0);
+    } else {
+      entry.payloads_l2_unit_known_ = false;
+      entry.payloads_l2_unit_ = false;
     }
   }
   return ret;

@@ -55,6 +55,7 @@ ObDASIvfCidVecCacheScanIter::ObDASIvfCidVecCacheScanIter()
     mode_(ScanMode::MISS),
     current_cid_(0),
     replay_entry_(nullptr),
+    replay_entry_shell_(nullptr),
     replay_idx_(0),
     building_cluster_(),
     cid_fill_leader_(false),
@@ -91,6 +92,12 @@ bool ObDASIvfCidVecCacheScanIter::skip_payload_lob_read(ObDASScanIter *cid_vec_i
   return is_row_materialized(cid_vec_iter, batch_idx);
 }
 
+bool ObDASIvfCidVecCacheScanIter::cache_was_active_iter(ObDASScanIter *cid_vec_iter)
+{
+  const ObDASIvfCidVecCacheScanIter *cache_iter = dynamic_cast<const ObDASIvfCidVecCacheScanIter *>(cid_vec_iter);
+  return OB_NOT_NULL(cache_iter) && cache_iter->cache_was_active_;
+}
+
 bool ObDASIvfCidVecCacheScanIter::get_cached_payloads_l2_unit(
     ObDASScanIter *cid_vec_iter,
     bool &is_unit,
@@ -106,6 +113,51 @@ bool ObDASIvfCidVecCacheScanIter::get_cached_payloads_l2_unit(
     is_unit = cache_iter->replay_entry_->payloads_l2_unit_;
   }
   return known;
+}
+
+void ObDASIvfCidVecCacheScanIter::record_replay_unit_cid(ObDASScanIter *cid_vec_iter)
+{
+  ObDASIvfCidVecCacheScanIter *cache_iter = dynamic_cast<ObDASIvfCidVecCacheScanIter *>(cid_vec_iter);
+  if (OB_NOT_NULL(cache_iter) && cache_iter->cache_was_active_) {
+    ++cache_iter->session_stats_.replay_unit_cid_cnt_;
+  }
+}
+
+void ObDASIvfCidVecCacheScanIter::record_replay_norm_row(
+    ObDASScanIter *cid_vec_iter,
+    const bool replay_unit_cid_at_scan_start,
+    const ObIvfReplayNormRowKind kind)
+{
+  ObDASIvfCidVecCacheScanIter *cache_iter = dynamic_cast<ObDASIvfCidVecCacheScanIter *>(cid_vec_iter);
+  if (OB_ISNULL(cache_iter) || !cache_iter->cache_was_active_) {
+  } else {
+    share::ObIvfCidClusterCacheSessionStats &s = cache_iter->session_stats_;
+    switch (kind) {
+      case ObIvfReplayNormRowKind::SKIP_NORM:
+        ++s.replay_skip_norm_row_cnt_;
+        break;
+      case ObIvfReplayNormRowKind::MEMCPY:
+        ++s.replay_norm_memcpy_row_cnt_;
+        if (replay_unit_cid_at_scan_start) {
+          ++s.replay_unit_violation_memcpy_cnt_;
+        }
+        break;
+      case ObIvfReplayNormRowKind::L2_FIRST_PROBE:
+        ++s.replay_first_vec_l2_probe_cnt_;
+        if (replay_unit_cid_at_scan_start) {
+          ++s.replay_unit_violation_l2_cnt_;
+        }
+        break;
+      case ObIvfReplayNormRowKind::L2_PER_ROW:
+        ++s.replay_norm_l2_row_cnt_;
+        if (replay_unit_cid_at_scan_start) {
+          ++s.replay_unit_violation_l2_cnt_;
+        }
+        break;
+      default:
+        break;
+    }
+  }
 }
 
 int ObDASIvfCidVecCacheScanIter::ensure_storage_scan()
@@ -128,8 +180,12 @@ bool ObDASIvfCidVecCacheScanIter::scan_delegates_to_base_no_cache() const
 
 bool ObDASIvfCidVecCacheScanIter::needs_lightweight_cid_switch() const
 {
-  return mode_ == ScanMode::MISS && building_cluster_.row_count_ <= 0
-      && OB_ISNULL(building_cluster_.arena_);
+  // Skip flush_building_cluster when there is no partial FILL in flight.
+  // Previously only MISS→MISS was lightweight; REPLAY→REPLAY always paid flush overhead.
+  if (building_cluster_.row_count_ > 0 || OB_NOT_NULL(building_cluster_.arena_) || cid_fill_leader_) {
+    return false;
+  }
+  return true;
 }
 
 int ObDASIvfCidVecCacheScanIter::delegate_base_rescan()
@@ -198,6 +254,7 @@ int ObDASIvfCidVecCacheScanIter::inner_init(ObDASIterParam &param)
     mode_ = ScanMode::MISS;
     current_cid_ = 0;
     replay_entry_ = nullptr;
+    replay_entry_shell_ = nullptr;
     replay_idx_ = 0;
     cid_fill_leader_ = false;
     active_iter_ = this;
@@ -274,6 +331,10 @@ int ObDASIvfCidVecCacheScanIter::inner_reuse()
     cid_fill_leader_ = false;
   }
   release_replay_entry();
+  if (OB_NOT_NULL(replay_entry_shell_) && OB_NOT_NULL(cluster_cache_)) {
+    cluster_cache_->release_session_entry(replay_entry_shell_);
+    replay_entry_shell_ = nullptr;
+  }
   discard_building_cluster();
   replay_idx_ = 0;
   clear_materialized_batch();
@@ -291,6 +352,10 @@ int ObDASIvfCidVecCacheScanIter::inner_release()
     cid_fill_leader_ = false;
   }
   release_replay_entry();
+  if (OB_NOT_NULL(replay_entry_shell_) && OB_NOT_NULL(cluster_cache_)) {
+    cluster_cache_->release_session_entry(replay_entry_shell_);
+    replay_entry_shell_ = nullptr;
+  }
   (void)flush_building_cluster();
   log_session_stats_if_enabled();
   if (OB_NOT_NULL(cluster_cache_)) {
@@ -342,7 +407,12 @@ int ObDASIvfCidVecCacheScanIter::parse_current_cid(uint64_t &cid)
 void ObDASIvfCidVecCacheScanIter::release_replay_entry()
 {
   if (OB_NOT_NULL(cluster_cache_) && OB_NOT_NULL(replay_entry_)) {
-    cluster_cache_->release_session_entry(replay_entry_);
+    if (OB_NOT_NULL(replay_entry_shell_) && replay_entry_ != replay_entry_shell_) {
+      cluster_cache_->release_session_entry(replay_entry_);
+    } else {
+      cluster_cache_->detach_session_replay_entry(replay_entry_);
+      replay_entry_shell_ = replay_entry_;
+    }
   }
   replay_entry_ = nullptr;
   replay_idx_ = 0;
@@ -390,20 +460,32 @@ void ObDASIvfCidVecCacheScanIter::discard_building_cluster()
 int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
 {
   int ret = OB_SUCCESS;
+  const bool rec_so = ob_ivf_fine_cv_scan_open_sub_recording();
+  const int64_t t_acquire_beg = rec_so ? ObTimeUtility::current_time() : 0;
   if (OB_ISNULL(cluster_cache_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     share::ObIvfCidClusterLookupResult lookup_result = share::ObIvfCidClusterLookupResult::MISS;
     const int64_t acquire_beg_us = ObTimeUtility::current_time();
-    if (OB_FAIL(cluster_cache_->lookup_cid(new_cid, replay_entry_, lookup_result, &session_stats_))) {
+    if (OB_FAIL(cluster_cache_->lookup_cid(
+            new_cid, replay_entry_, lookup_result, &session_stats_, replay_entry_shell_))) {
       LOG_WARN("failed to lookup cid cluster", K(ret), K(new_cid));
     }
     session_stats_.acquire_us_ += ObTimeUtility::current_time() - acquire_beg_us;
+    if (rec_so) {
+      ob_ivf_fine_cv_scan_open_sub_add(
+          ObIvfFineCvScanOpenSubKind::CACHE_LOOKUP, ObTimeUtility::current_time() - acquire_beg_us);
+    }
     if (OB_FAIL(ret)) {
     } else if (lookup_result == share::ObIvfCidClusterLookupResult::HIT) {
-      revert_storage_scan_iter_if_any();
+      if (OB_NOT_NULL(get_output_result_iter())) {
+        revert_storage_scan_iter_if_any();
+      }
       mode_ = ScanMode::REPLAY;
       replay_idx_ = 0;
+      if (OB_NOT_NULL(replay_entry_) && replay_entry_shell_ != replay_entry_) {
+        replay_entry_shell_ = replay_entry_;
+      }
       session_stats_.replay_cid_cnt_++;
     } else if (lookup_result == share::ObIvfCidClusterLookupResult::MISS) {
       mode_ = ScanMode::MISS;
@@ -434,17 +516,39 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
       LOG_WARN("unexpected lookup result", K(ret), K(new_cid), K(static_cast<int>(lookup_result)));
     }
   }
+  if (rec_so && t_acquire_beg > 0) {
+    ob_ivf_fine_cv_scan_open_sub_add(
+        ObIvfFineCvScanOpenSubKind::CACHE_ACQUIRE, ObTimeUtility::current_time() - t_acquire_beg);
+  }
   return ret;
 }
 
 int ObDASIvfCidVecCacheScanIter::on_cid_switch(uint64_t new_cid)
 {
   int ret = OB_SUCCESS;
+  const bool rec_so = ob_ivf_fine_cv_scan_open_sub_recording();
   if (!cache_was_active_) {
-  } else if (!needs_lightweight_cid_switch() && OB_FAIL(flush_building_cluster())) {
-    LOG_WARN("failed to flush building cluster", K(ret));
-  } else {
+  } else if (mode_ == ScanMode::REPLAY && new_cid == current_cid_ && OB_NOT_NULL(replay_entry_)) {
+    replay_idx_ = 0;
+    clear_materialized_batch();
+    session_stats_.cid_switch_cnt_++;
+    return ret;
+  } else if (!needs_lightweight_cid_switch()) {
+    const int64_t t_flush_beg = rec_so ? ObTimeUtility::current_time() : 0;
+    if (OB_FAIL(flush_building_cluster())) {
+      LOG_WARN("failed to flush building cluster", K(ret));
+    } else if (rec_so && t_flush_beg > 0) {
+      ob_ivf_fine_cv_scan_open_sub_add(
+          ObIvfFineCvScanOpenSubKind::CACHE_FLUSH, ObTimeUtility::current_time() - t_flush_beg);
+    }
+  }
+  if (cache_was_active_ && OB_SUCC(ret)) {
+    const int64_t t_release_beg = rec_so ? ObTimeUtility::current_time() : 0;
     release_replay_entry();
+    if (rec_so && t_release_beg > 0) {
+      ob_ivf_fine_cv_scan_open_sub_add(
+          ObIvfFineCvScanOpenSubKind::CACHE_RELEASE, ObTimeUtility::current_time() - t_release_beg);
+    }
     current_cid_ = new_cid;
     clear_materialized_batch();
     cid_fill_leader_ = false;
@@ -460,20 +564,37 @@ int ObDASIvfCidVecCacheScanIter::on_cid_switch(uint64_t new_cid)
 int ObDASIvfCidVecCacheScanIter::rescan()
 {
   int ret = OB_SUCCESS;
+  const bool rec_so = ob_ivf_fine_cv_scan_open_sub_recording();
   if (!cache_was_active_) {
+    const int64_t t_rescan_beg = rec_so ? ObTimeUtility::current_time() : 0;
     ret = delegate_base_rescan();
+    if (rec_so && t_rescan_beg > 0) {
+      ob_ivf_fine_cv_scan_open_sub_add(
+          ObIvfFineCvScanOpenSubKind::STORAGE_RESCAN, ObTimeUtility::current_time() - t_rescan_beg);
+    }
   } else {
     uint64_t cid = 0;
+    const int64_t t_parse_beg = rec_so ? ObTimeUtility::current_time() : 0;
     if (OB_FAIL(parse_current_cid(cid))) {
       LOG_WARN("failed to parse cid", K(ret));
-    } else if (OB_FAIL(on_cid_switch(cid))) {
-      LOG_WARN("failed on cid switch", K(ret), K(cid));
-      finish_fill_leader_if_any();
-    } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
-      ret = ensure_storage_scan();
-      if (OB_FAIL(ret)) {
-        LOG_WARN("failed to ensure storage scan", K(ret));
+    } else {
+      if (rec_so && t_parse_beg > 0) {
+        ob_ivf_fine_cv_scan_open_sub_add(
+            ObIvfFineCvScanOpenSubKind::CACHE_PARSE_CID, ObTimeUtility::current_time() - t_parse_beg);
+      }
+      if (OB_FAIL(on_cid_switch(cid))) {
+        LOG_WARN("failed on cid switch", K(ret), K(cid));
         finish_fill_leader_if_any();
+      } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
+        const int64_t t_ensure_beg = rec_so ? ObTimeUtility::current_time() : 0;
+        ret = ensure_storage_scan();
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to ensure storage scan", K(ret));
+          finish_fill_leader_if_any();
+        } else if (rec_so && t_ensure_beg > 0) {
+          ob_ivf_fine_cv_scan_open_sub_add(
+              ObIvfFineCvScanOpenSubKind::CACHE_ENSURE_STORAGE, ObTimeUtility::current_time() - t_ensure_beg);
+        }
       }
     }
   }
@@ -483,20 +604,32 @@ int ObDASIvfCidVecCacheScanIter::rescan()
 int ObDASIvfCidVecCacheScanIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
+  const bool rec_so = ob_ivf_fine_cv_scan_open_sub_recording();
   if (!cache_was_active_) {
     ret = delegate_base_do_table_scan();
   } else {
     uint64_t cid = 0;
+    const int64_t t_parse_beg = rec_so ? ObTimeUtility::current_time() : 0;
     if (OB_FAIL(parse_current_cid(cid))) {
       LOG_WARN("failed to parse cid", K(ret));
-    } else if (OB_FAIL(on_cid_switch(cid))) {
-      LOG_WARN("failed on cid switch", K(ret), K(cid));
-      finish_fill_leader_if_any();
-    } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
-      ret = ensure_storage_scan();
-      if (OB_FAIL(ret)) {
-        LOG_WARN("failed to ensure storage scan", K(ret));
+    } else {
+      if (rec_so && t_parse_beg > 0) {
+        ob_ivf_fine_cv_scan_open_sub_add(
+            ObIvfFineCvScanOpenSubKind::CACHE_PARSE_CID, ObTimeUtility::current_time() - t_parse_beg);
+      }
+      if (OB_FAIL(on_cid_switch(cid))) {
+        LOG_WARN("failed on cid switch", K(ret), K(cid));
         finish_fill_leader_if_any();
+      } else if (scan_delegates_to_base_no_cache() || mode_ == ScanMode::FILL) {
+        const int64_t t_ensure_beg = rec_so ? ObTimeUtility::current_time() : 0;
+        ret = ensure_storage_scan();
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to ensure storage scan", K(ret));
+          finish_fill_leader_if_any();
+        } else if (rec_so && t_ensure_beg > 0) {
+          ob_ivf_fine_cv_scan_open_sub_add(
+              ObIvfFineCvScanOpenSubKind::CACHE_ENSURE_STORAGE, ObTimeUtility::current_time() - t_ensure_beg);
+        }
       }
     }
   }
@@ -575,7 +708,8 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
           building_cluster_.entry_bytes_ += payload.length()
               + ob_ivf_cid_rowkey_storage_bytes(obj_buf, rk);
           session_stats_.fill_row_cnt_++;
-          if (building_cluster_.row_count_ == 1 && !building_cluster_.payloads_l2_unit_known_) {
+          if (building_cluster_.row_count_ == 1 && !building_cluster_.payloads_l2_unit_known_
+              && payload_type() == share::IVF_CID_CLUSTER_PAYLOAD_FLAT_FLOAT) {
             bool is_unit = false;
             if (share::ivf_cid_flat_fill_probe_first_payload_l2_unit(building_cluster_.flat_fill_, is_unit)) {
               building_cluster_.payloads_l2_unit_known_ = true;
@@ -755,6 +889,10 @@ void ObDASIvfCidVecCacheScanIter::reset_per_query_session_stats()
     cid_fill_leader_ = false;
   }
   release_replay_entry();
+  if (OB_NOT_NULL(replay_entry_shell_) && OB_NOT_NULL(cluster_cache_)) {
+    cluster_cache_->release_session_entry(replay_entry_shell_);
+    replay_entry_shell_ = nullptr;
+  }
   discard_building_cluster();
   replay_idx_ = 0;
   clear_materialized_batch();

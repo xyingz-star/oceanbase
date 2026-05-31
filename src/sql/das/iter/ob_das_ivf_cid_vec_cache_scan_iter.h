@@ -22,6 +22,15 @@ namespace oceanbase
 namespace sql
 {
 
+/// Per-row norm path in get_rowkeys_to_heap when skip_payload_lob_read (REPLAY/FILL materialized).
+enum class ObIvfReplayNormRowKind : int8_t
+{
+  SKIP_NORM = 0,
+  MEMCPY = 1,
+  L2_FIRST_PROBE = 2,
+  L2_PER_ROW = 3,
+};
+
 struct ObDASIvfCidVecCacheScanIterParam : public ObDASScanIterParam
 {
   ObDASIvfCidVecCacheScanIterParam()
@@ -45,6 +54,13 @@ public:
   static bool skip_payload_lob_read(ObDASScanIter *cid_vec_iter, int64_t batch_idx = 0);
   /// REPLAY only: FILL recorded whether cluster payloads are already L2 unit (from flat header).
   static bool get_cached_payloads_l2_unit(ObDASScanIter *cid_vec_iter, bool &is_unit, bool &known);
+  static bool cache_was_active_iter(ObDASScanIter *cid_vec_iter);
+  /// cache_unit=1 && cid_vec_need_norm=0 at start of fine CV scan for this cid.
+  static void record_replay_unit_cid(ObDASScanIter *cid_vec_iter);
+  static void record_replay_norm_row(
+      ObDASScanIter *cid_vec_iter,
+      const bool replay_unit_cid_at_scan_start,
+      const ObIvfReplayNormRowKind kind);
   /// REPLAY serves rows from cache memory; no storage ObTableScanIterator (output_result_iter is null).
   static bool cid_vec_skips_storage_output_result_iter(ObDASScanIter *cid_vec_iter);
   static ObDASIvfCidVecCacheScanIter *get_active_iter() { return active_iter_; }
@@ -98,6 +114,7 @@ private:
   ScanMode mode_;
   uint64_t current_cid_;
   share::ObIvfCidClusterEntry *replay_entry_;
+  share::ObIvfCidClusterEntry *replay_entry_shell_;
   int64_t replay_idx_;
   share::ObIvfCidClusterEntry building_cluster_;
   bool cid_fill_leader_;

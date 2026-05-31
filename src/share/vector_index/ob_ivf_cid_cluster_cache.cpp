@@ -33,7 +33,7 @@ namespace share
 using namespace common;
 
 static const int64_t IVF_CID_CLUSTER_CACHE_MIN_ENTRY_BYTES = 1024;
-static const int64_t DEFAULT_IVF_CID_CLUSTER_CACHE_MAX_MB = 128;
+static const int64_t DEFAULT_IVF_CID_CLUSTER_CACHE_MAX_MB = 10 * 1024; // 10GB
 static const int64_t DEFAULT_IVF_CID_CLUSTER_REPLAY_HEAT_WEIGHT = 2;
 /// Min probe access_cnt on a cid before a miss may become FILL leader (default 5: early touches STORAGE_ONLY).
 static const int64_t DEFAULT_IVF_CID_CLUSTER_CACHE_FILL_MIN_PROBE_ACCESS = 5;
@@ -159,6 +159,13 @@ void ObIvfCidClusterCacheSessionStats::reset()
   storage_fetch_us_ = 0;
   replay_serve_us_ = 0;
   fill_append_us_ = 0;
+  replay_unit_cid_cnt_ = 0;
+  replay_skip_norm_row_cnt_ = 0;
+  replay_norm_memcpy_row_cnt_ = 0;
+  replay_first_vec_l2_probe_cnt_ = 0;
+  replay_norm_l2_row_cnt_ = 0;
+  replay_unit_violation_memcpy_cnt_ = 0;
+  replay_unit_violation_l2_cnt_ = 0;
   has_cache_snap_begin_ = false;
   cache_snap_begin_.reset();
 }
@@ -254,6 +261,9 @@ static void ob_ivf_cid_cluster_cache_format_stats_line(
       "fill_cid_cnt=%lld cid_hit_rate=%f storage_fetch_us=%lld replay_serve_us=%lld fill_append_us=%lld "
       "acquire_us=%lld fill_row_cnt=%lld replay_row_cnt=%lld "
       "row_replay_rate=%f put_cid_ok=%lld put_cid_fail=%lld put_skip_pinned=%lld put_rows=%lld "
+      "replay_unit_cid_cnt=%lld replay_skip_norm_row_cnt=%lld replay_norm_memcpy_row_cnt=%lld "
+      "replay_first_vec_l2_probe_cnt=%lld replay_norm_l2_row_cnt=%lld "
+      "replay_unit_violation_memcpy_cnt=%lld replay_unit_violation_l2_cnt=%lld "
       "cache_d_get_hit=%lld cache_d_get_miss=%lld "
       "cache_d_put_ok=%lld cache_d_put_skip_cap=%lld cur_entry_cnt=%lld cur_bytes=%lld max_bytes=%lld\n",
       phase_str,
@@ -282,6 +292,13 @@ static void ob_ivf_cid_cluster_cache_format_stats_line(
       static_cast<long long>(s.put_cid_fail_cnt_),
       static_cast<long long>(s.put_cid_skip_pinned_cnt_),
       static_cast<long long>(s.put_rows_total_),
+      static_cast<long long>(s.replay_unit_cid_cnt_),
+      static_cast<long long>(s.replay_skip_norm_row_cnt_),
+      static_cast<long long>(s.replay_norm_memcpy_row_cnt_),
+      static_cast<long long>(s.replay_first_vec_l2_probe_cnt_),
+      static_cast<long long>(s.replay_norm_l2_row_cnt_),
+      static_cast<long long>(s.replay_unit_violation_memcpy_cnt_),
+      static_cast<long long>(s.replay_unit_violation_l2_cnt_),
       static_cast<long long>(d_get_hit),
       static_cast<long long>(d_get_miss),
       static_cast<long long>(d_put_ok),
@@ -410,6 +427,7 @@ void log_ivf_cid_cluster_cache_snapshot_to_observer(const ObIvfCidClusterCacheLo
   }
   const ObIvfCidClusterCacheSessionStats &s = snap.session_;
   const int64_t query_cache_hit = ob_ivf_cid_cluster_cache_query_cache_hit(s);
+  // LOG_KVS supports at most 44 args; split session stats across two lines.
   LOG_INFO("[OB_IVF_CID_CLUSTER_CACHE_STATS] session",
            K(snap.index_epoch_),
            K(snap.algorithm_type_),
@@ -426,11 +444,19 @@ void log_ivf_cid_cluster_cache_snapshot_to_observer(const ObIvfCidClusterCacheLo
            K(s.acquire_us_),
            K(s.fill_row_cnt_),
            K(s.replay_row_cnt_),
-           "row_replay_rate", ob_ivf_cid_cluster_cache_row_replay_rate(s),
+           "row_replay_rate", ob_ivf_cid_cluster_cache_row_replay_rate(s));
+  LOG_INFO("[OB_IVF_CID_CLUSTER_CACHE_STATS] session_put_replay",
            K(s.put_cid_ok_cnt_),
            K(s.put_cid_fail_cnt_),
            K(s.put_cid_skip_pinned_cnt_),
-           K(s.put_rows_total_));
+           K(s.put_rows_total_),
+           K(s.replay_unit_cid_cnt_),
+           K(s.replay_skip_norm_row_cnt_),
+           K(s.replay_norm_memcpy_row_cnt_),
+           K(s.replay_first_vec_l2_probe_cnt_),
+           K(s.replay_norm_l2_row_cnt_),
+           K(s.replay_unit_violation_memcpy_cnt_),
+           K(s.replay_unit_violation_l2_cnt_));
   if (OB_NOT_NULL(snap.cluster_cache_)) {
     ObIvfCidClusterCacheStats cs;
     cs.reset();
@@ -867,27 +893,53 @@ void ObIvfCidClusterCache::record_access_(const uint64_t cid)
   }
 }
 
-int ObIvfCidClusterCache::try_lookup_hit_(uint64_t cid, ObIvfCidClusterEntry *&entry)
+int ObIvfCidClusterCache::try_lookup_hit_(
+    uint64_t cid,
+    ObIvfCidClusterEntry *&entry,
+    ObIvfCidClusterEntry *reuse_shell)
 {
   int ret = OB_SUCCESS;
   entry = nullptr;
   const uint64_t epoch = load_index_epoch_();
   ObIvfKvEntryPrep prep;
-  const int prep_ret = load_kv_entry_prep_(cid, epoch, prep);
+  const int prep_ret = load_kv_entry_prep_(cid, epoch, prep, reuse_shell);
   if (prep_ret != OB_SUCCESS) {
     return prep_ret;
   }
-  prep.view_entry_->session_owned_ = true;
-  if (OB_FAIL(prep.view_entry_->session_kv_handle_.assign(prep.kv_handle_))) {
-    discard_kv_entry_prep_(prep);
+  ObIvfCidClusterEntry *view_entry = OB_NOT_NULL(reuse_shell) ? reuse_shell : prep.view_entry_;
+  if (OB_ISNULL(view_entry)) {
     ATOMIC_INC(&stats_.get_miss_cnt_);
     return OB_ERR_UNEXPECTED;
   }
-  entry = prep.view_entry_;
+  if (OB_NOT_NULL(reuse_shell)) {
+    prep.view_entry_ = nullptr;
+  }
+  view_entry->session_owned_ = true;
+  if (OB_FAIL(view_entry->session_kv_handle_.assign(prep.kv_handle_))) {
+    if (OB_ISNULL(reuse_shell)) {
+      discard_kv_entry_prep_(prep);
+    }
+    ATOMIC_INC(&stats_.get_miss_cnt_);
+    return OB_ERR_UNEXPECTED;
+  }
+  entry = view_entry;
   prep.view_entry_ = nullptr;
   prep.kv_handle_.reset();
   ATOMIC_INC(&stats_.get_hit_cnt_);
   return OB_SUCCESS;
+}
+
+void ObIvfCidClusterCache::detach_session_replay_entry(ObIvfCidClusterEntry *entry)
+{
+  if (OB_ISNULL(entry) || !entry->session_owned_) {
+    return;
+  }
+  entry->session_kv_handle_.reset();
+  entry->kv_flat_buf_ = nullptr;
+  entry->rowkey_objs_ = nullptr;
+  entry->row_count_ = 0;
+  entry->cid_ = 0;
+  entry->entry_bytes_ = 0;
 }
 
 void ObIvfCidClusterCache::release_session_entry(ObIvfCidClusterEntry *entry)
@@ -918,7 +970,11 @@ void ObIvfCidClusterCache::discard_kv_entry_prep_(ObIvfKvEntryPrep &prep)
   prep.rowkey_obj_cnt_ = 0;
 }
 
-int ObIvfCidClusterCache::load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvEntryPrep &prep)
+int ObIvfCidClusterCache::load_kv_entry_prep_(
+    uint64_t cid,
+    uint64_t index_epoch,
+    ObIvfKvEntryPrep &prep,
+    ObIvfCidClusterEntry *reuse_shell)
 {
   int ret = OB_SUCCESS;
   discard_kv_entry_prep_(prep);
@@ -943,16 +999,24 @@ int ObIvfCidClusterCache::load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch
     ATOMIC_INC(&stats_.get_miss_cnt_);
     return OB_HASH_NOT_EXIST;
   }
-  ObIvfCidClusterEntry *view_entry = nullptr;
-  if (OB_FAIL(ivf_cid_flat_open_replay_entry(flat_buf, flat_len, view_entry))) {
-    LOG_WARN("failed to open flat replay entry", K(ret), K(cid));
-    return ret;
-  }
   prep.flat_buf_ = flat_buf;
   prep.flat_len_ = flat_len;
-  prep.view_entry_ = view_entry;
   prep.rowkey_objs_ = nullptr;
   prep.rowkey_obj_cnt_ = 0;
+  if (OB_NOT_NULL(reuse_shell)) {
+    if (OB_FAIL(ivf_cid_flat_reopen_replay_entry(flat_buf, flat_len, *reuse_shell))) {
+      LOG_WARN("failed to reopen flat replay entry", K(ret), K(cid));
+      return ret;
+    }
+    prep.view_entry_ = nullptr;
+  } else {
+    ObIvfCidClusterEntry *view_entry = nullptr;
+    if (OB_FAIL(ivf_cid_flat_open_replay_entry(flat_buf, flat_len, view_entry))) {
+      LOG_WARN("failed to open flat replay entry", K(ret), K(cid));
+      return ret;
+    }
+    prep.view_entry_ = view_entry;
+  }
   if (OB_FAIL(prep.kv_handle_.assign(kv_handle))) {
     LOG_WARN("failed to assign kv handle for kv entry prep", K(ret), K(cid));
     discard_kv_entry_prep_(prep);
@@ -965,7 +1029,8 @@ int ObIvfCidClusterCache::lookup_cid(
     uint64_t cid,
     ObIvfCidClusterEntry *&entry,
     ObIvfCidClusterLookupResult &result,
-    ObIvfCidClusterCacheSessionStats *session_stats)
+    ObIvfCidClusterCacheSessionStats *session_stats,
+    ObIvfCidClusterEntry *reuse_shell)
 {
   int ret = OB_SUCCESS;
   entry = nullptr;
@@ -974,7 +1039,7 @@ int ObIvfCidClusterCache::lookup_cid(
     ret = OB_NOT_INIT;
   } else {
     record_access_(cid);
-    const int hit_ret = try_lookup_hit_(cid, entry);
+    const int hit_ret = try_lookup_hit_(cid, entry, reuse_shell);
     if (OB_SUCCESS == hit_ret) {
       result = ObIvfCidClusterLookupResult::HIT;
       return OB_SUCCESS;

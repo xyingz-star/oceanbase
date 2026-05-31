@@ -106,6 +106,7 @@ struct ObIvfCidFlatFillState
   char *data_buf_;
   int64_t data_cap_;
   int64_t data_len_;
+  ObIvfCidClusterPayloadType payload_type_;
   common::ObSEArray<int64_t, 64> payload_off_;
   common::ObSEArray<int32_t, 64> payload_len_;
   common::ObSEArray<int64_t, 64> rk_off_;
@@ -139,6 +140,11 @@ int ivf_cid_flat_attach_entry(const char *flat_buf,
 int ivf_cid_flat_open_replay_entry(const char *flat_buf,
     const int64_t flat_len,
     ObIvfCidClusterEntry *&out_entry);
+
+/// Rebind an existing session-owned replay shell to a new flat blob (no alloc/free).
+int ivf_cid_flat_reopen_replay_entry(const char *flat_buf,
+    const int64_t flat_len,
+    ObIvfCidClusterEntry &entry);
 
 /// Materialize one row from flat blob; vector payload is zero-copy; rowkey decoded into rk_scratch.
 int ivf_cid_flat_replay_row_at(const char *flat_buf,

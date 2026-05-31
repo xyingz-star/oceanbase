@@ -145,13 +145,17 @@ public:
   int64_t get_max_bytes() const { return max_bytes_; }
   ObIvfCidClusterCidPhase get_cid_phase(uint64_t cid) const;
   /// Per-CID: HIT via ObKVCache only; else FILL_LEADER or MISS.
+  /// reuse_shell: detached replay view entry to reuse across cid switches (avoids OB_NEW/OB_DELETE per probe).
   int lookup_cid(uint64_t cid,
       ObIvfCidClusterEntry *&entry,
       ObIvfCidClusterLookupResult &result,
-      ObIvfCidClusterCacheSessionStats *session_stats = nullptr);
+      ObIvfCidClusterCacheSessionStats *session_stats = nullptr,
+      ObIvfCidClusterEntry *reuse_shell = nullptr);
   void finish_cid_fill(uint64_t cid);
   int put(ObIvfCidClusterEntry &entry);
   void release_session_entry(ObIvfCidClusterEntry *entry);
+  /// Drop KV pin but keep session-owned entry shell for lookup_cid(..., reuse_shell).
+  void detach_session_replay_entry(ObIvfCidClusterEntry *entry);
   void inc_ref();
   void dec_ref();
   int64_t get_ref() const { return ref_cnt_; }
@@ -175,7 +179,7 @@ private:
     int64_t rowkey_obj_cnt_;
     common::ObKVCacheHandle kv_handle_;
   };
-  int load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvEntryPrep &prep);
+  int load_kv_entry_prep_(uint64_t cid, uint64_t index_epoch, ObIvfKvEntryPrep &prep, ObIvfCidClusterEntry *reuse_shell = nullptr);
   void discard_kv_entry_prep_(ObIvfKvEntryPrep &prep);
   void ledger_drop_cached_(uint64_t cid, bool erase_kv = true);
   void ledger_commit_(uint64_t cid, int64_t bytes);
@@ -192,7 +196,7 @@ private:
   lib::ObMutex &fill_gate_shard_lock_(uint64_t cid);
   const lib::ObMutex &fill_gate_shard_lock_(uint64_t cid) const;
   int ledger_remove_(uint64_t cid, bool erase_kv = true);
-  int try_lookup_hit_(uint64_t cid, ObIvfCidClusterEntry *&entry);
+  int try_lookup_hit_(uint64_t cid, ObIvfCidClusterEntry *&entry, ObIvfCidClusterEntry *reuse_shell = nullptr);
   int try_acquire_fill_leader_(uint64_t cid,
       ObIvfCidClusterEntry *&entry,
       ObIvfCidClusterLookupResult &result,
@@ -268,6 +272,20 @@ struct ObIvfCidClusterCacheSessionStats
   int64_t storage_fetch_us_;
   int64_t replay_serve_us_;
   int64_t fill_append_us_;
+  /// REPLAY cids whose flat header says payloads are L2 unit (cache_unit=1, cid_vec_need_norm=0 at scan start).
+  int64_t replay_unit_cid_cnt_;
+  /// cache_zero_copy rows with will_norm=false (expected when replay_unit_cid).
+  int64_t replay_skip_norm_row_cnt_;
+  /// per-row MEMCPY(dim*4) before L2 in cache_zero_copy path.
+  int64_t replay_norm_memcpy_row_cnt_;
+  /// is_first_vec L2 probe (sets cid_vec_need_norm for rest of query).
+  int64_t replay_first_vec_l2_probe_cnt_;
+  /// per-row L2_normalize when cid_vec_need_norm (not first-vec probe).
+  int64_t replay_norm_l2_row_cnt_;
+  /// MEMCPY on a replay_unit_cid (should stay 0 if unit vectors skip re-norm).
+  int64_t replay_unit_violation_memcpy_cnt_;
+  /// per-row L2 on a replay_unit_cid (should stay 0).
+  int64_t replay_unit_violation_l2_cnt_;
   bool has_cache_snap_begin_;
   ObIvfCidClusterCacheStats cache_snap_begin_;
 };

@@ -30,6 +30,9 @@ static int64_t g_ivf_per_query_stats_owner_tid = 0;
 
 thread_local bool tls_ivf_per_query_stats_emit = false;
 
+thread_local int64_t tls_ivf_fine_cv_scan_open_sub[static_cast<int>(ObIvfFineCvScanOpenSubKind::MAX_KIND)] = {0};
+thread_local bool tls_ivf_fine_cv_scan_open_sub_active = false;
+
 OB_INLINE void ob_ivf_per_query_stats_on_scan_start()
 {
   const int64_t now_us = ObTimeUtility::current_time();
@@ -129,6 +132,45 @@ bool ob_ivf_per_query_stats_begin_query(
 bool ob_ivf_per_query_stats_emit_this_query()
 {
   return tls_ivf_per_query_stats_emit;
+}
+
+void ob_ivf_fine_cv_scan_open_sub_reset()
+{
+  for (int i = 0; i < static_cast<int>(ObIvfFineCvScanOpenSubKind::MAX_KIND); ++i) {
+    tls_ivf_fine_cv_scan_open_sub[i] = 0;
+  }
+  tls_ivf_fine_cv_scan_open_sub_active = false;
+}
+
+void ob_ivf_fine_cv_scan_open_sub_set_active(const bool active)
+{
+  tls_ivf_fine_cv_scan_open_sub_active = active;
+}
+
+bool ob_ivf_fine_cv_scan_open_sub_recording()
+{
+  return tls_ivf_fine_cv_scan_open_sub_active && tls_ivf_per_query_stats_emit
+      && ob_ivf_latency_breakdown_enabled();
+}
+
+void ob_ivf_fine_cv_scan_open_sub_add(const ObIvfFineCvScanOpenSubKind kind, const int64_t us)
+{
+  if (!ob_ivf_fine_cv_scan_open_sub_recording() || us <= 0) {
+  } else {
+    const int idx = static_cast<int>(kind);
+    if (idx >= 0 && idx < static_cast<int>(ObIvfFineCvScanOpenSubKind::MAX_KIND)) {
+      tls_ivf_fine_cv_scan_open_sub[idx] += us;
+    }
+  }
+}
+
+int64_t ob_ivf_fine_cv_scan_open_sub_get(const ObIvfFineCvScanOpenSubKind kind)
+{
+  const int idx = static_cast<int>(kind);
+  if (idx < 0 || idx >= static_cast<int>(ObIvfFineCvScanOpenSubKind::MAX_KIND)) {
+    return 0;
+  }
+  return tls_ivf_fine_cv_scan_open_sub[idx];
 }
 
 } // namespace sql

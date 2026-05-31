@@ -33,6 +33,27 @@ bool ob_ivf_per_query_stats_begin_query(const int64_t dataset_rows, const int64_
 /// Whether the current query on this thread was selected for per-query logging (set by begin_query).
 bool ob_ivf_per_query_stats_emit_this_query();
 
+/// Sub-buckets for fine_cv_scan_open_us (cache iter rescan / on_cid_switch drill-down).
+enum class ObIvfFineCvScanOpenSubKind : int8_t
+{
+  RANGE = 0,
+  STORAGE_RESCAN,
+  CACHE_PARSE_CID,
+  CACHE_FLUSH,
+  CACHE_RELEASE,
+  CACHE_ACQUIRE,
+  CACHE_LOOKUP,
+  CACHE_ENSURE_STORAGE,
+  DAS_RESCAN_WRAPPER,
+  MAX_KIND
+};
+
+void ob_ivf_fine_cv_scan_open_sub_reset();
+void ob_ivf_fine_cv_scan_open_sub_set_active(const bool active);
+bool ob_ivf_fine_cv_scan_open_sub_recording();
+void ob_ivf_fine_cv_scan_open_sub_add(const ObIvfFineCvScanOpenSubKind kind, const int64_t us);
+int64_t ob_ivf_fine_cv_scan_open_sub_get(const ObIvfFineCvScanOpenSubKind kind);
+
 } // namespace sql
 } // namespace oceanbase
 

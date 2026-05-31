@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# IVF sweep（仅标准 / GPU 外部 K-means 路径）：默认只跑 **一组** 参数（单数据集 × 单 nlist 倍数）。
-# 默认：**1536D50K** + **SWEEP_NLIST_MULTS=0.25**（nlist≈sqrt(N)×0.25，与 conc=80 压测一致）。
-# 多组扫参：export SWEEP_DATASETS="1536D50K 1536D500K" SWEEP_NLIST_MULTS="0.25 0.5 1 2 4"
+# IVF sweep（仅标准 / GPU 外部 K-means 路径）：默认 **IVF_PQ**，扫 1536D50K / 1536D500K / 768D1M × 5 个 nlist 点。
+# 默认：**SWEEP_DATASETS="1536D50K 1536D500K 768D1M"** + **SWEEP_NLIST_MULTS="0.25 0.5 1 2 4"**（nlist≈sqrt(N)×mult）。
+# 单组快速试跑：export SWEEP_DATASETS=768D1M SWEEP_NLIST_MULTS=0.25
 # ONLY_DIRS=... 可覆盖数据集子集。
 # 全盘发现： SWEEP_DISCOVER_ALL_DIRS=1（且勿设 ONLY_DIRS / 勿缩小 SWEEP_DATASETS）。
-# 索引：默认 IVF_FLAT（INDEX_TYPE=ivf_flat）。
+# 索引：默认 IVF_PQ（INDEX_TYPE=ivf_pq）；FLAT 对照：export INDEX_TYPE=ivf_flat
 #
 # 每轮 bench 前默认删除 SWEEP_NMBKM_DIV_FILE（默认 /tmp/ob_nmbkm_min_n_scale），避免历史 sweep 写入的
 # div 仍被 observer 读取，从而误走 NMBKM 相关逻辑；便于专注验证「全量 / 外部 GPU」K-means。
@@ -43,7 +43,7 @@ CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 SWEEP_LOG_ENABLE="${SWEEP_LOG_ENABLE:-1}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${HOME}/log/vdb_ivf_sweep_gpu_km}"
 SWEEP_LOG_TIMESTAMP="${SWEEP_LOG_TIMESTAMP:-1}"
-SWEEP_NLIST_MULTS="${SWEEP_NLIST_MULTS:-0.25}"
+SWEEP_NLIST_MULTS="${SWEEP_NLIST_MULTS:-0.25 0.5 1 2 4}"
 # 与 observer 读取路径一致；仅用于 rm，本脚本不再写入 div
 SWEEP_NMBKM_DIV_FILE="${SWEEP_NMBKM_DIV_FILE:-/tmp/ob_nmbkm_min_n_scale}"
 # 1=每轮 bench 前删除 div 文件，避免 NMBKM 配置残留
@@ -57,9 +57,9 @@ export OB_IVF_CID_CLUSTER_CACHE_LOG_DIR="${OB_IVF_CID_CLUSTER_CACHE_LOG_DIR:-${H
 # Per-query cache final on owner thread only; per-CID progress opt-in (EVERY_N_CID>0, or STATS_LIVE=1).
 export OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID="${OB_IVF_CID_CLUSTER_CACHE_STATS_EVERY_N_CID:-0}"
 
-# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名；默认仅一组 1536D50K。
-SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K}"
-export INDEX_TYPE="${INDEX_TYPE:-ivf_flat}"
+# 空格分隔、相对 VEC_DATA_ROOT 的数据集目录名。
+SWEEP_DATASETS="${SWEEP_DATASETS:-1536D50K 1536D500K 768D1M}"
+export INDEX_TYPE="${INDEX_TYPE:-ivf_pq}"
 read -r -a _SWEEP_DATASET_ORDER <<< "${SWEEP_DATASETS}"
 DATASET_ORDER_SMALL_FIRST=(
   1536D50K 1536D500K 768D1M cohere openai 1536D5M 768D100K 768D10M
@@ -290,13 +290,16 @@ for base in "${_discovered[@]}"; do
     mult_tag="${mult}"
     mult_tag="${mult_tag//./p}"
 
-    if [[ "${mult}" == "1" ]]; then
+    _idx_lc="${INDEX_TYPE,,}"
+    if [[ "${_idx_lc}" == ivf_pq* ]]; then
+      label="sweep_${base}_gpu_km_ivfpq_nlist${nlist}_spn${spn}_N${_ds_n}"
+    elif [[ "${mult}" == "1" ]]; then
       label="sweep_${base}_gpu_km_sqrtn_nlist${nlist}_spn${spn}_N${_ds_n}"
     else
       label="sweep_${base}_gpu_km_sqrtn_m${mult_tag}_nlist${nlist}_spn${spn}_N${_ds_n}"
     fi
 
-    echo "==== ${base} ${ct} N=${_ds_n} base_nlist=${base_nlist} mult=${mult} nlist=${nlist} spn=${spn} probes=${probes} GPU_KM_SWEEP clear_nmbkm_div=${SWEEP_CLEAR_NMBKM_DIV_FILE} conc=${VDB_NUM_CONCURRENCY} $(date -Iseconds) ===="
+    echo "==== ${base} ${ct} N=${_ds_n} base_nlist=${base_nlist} mult=${mult} nlist=${nlist} spn=${spn} probes=${probes} INDEX_TYPE=${INDEX_TYPE} GPU_KM_SWEEP clear_nmbkm_div=${SWEEP_CLEAR_NMBKM_DIV_FILE} conc=${VDB_NUM_CONCURRENCY} $(date -Iseconds) ===="
 
     if [[ "${SWEEP_CLEAR_NMBKM_DIV_FILE}" == "1" ]]; then
       rm -f "${SWEEP_NMBKM_DIV_FILE}"
