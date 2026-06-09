@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# IVF sweep（仅标准 / GPU 外部 K-means 路径）：默认 **IVF_PQ**，扫 1536D50K / 1536D500K / 768D1M × 5 个 nlist 点。
+# IVF sweep（仅标准 / GPU 外部 K-means 路径）：默认 **IVF_PQ**，扫 **1536D50K 1536D500K 768D1M** × 5 个 nlist 点。
 # 默认：**SWEEP_DATASETS="1536D50K 1536D500K 768D1M"** + **SWEEP_NLIST_MULTS="0.25 0.5 1 2 4"**（nlist≈sqrt(N)×mult）。
 # 单组快速试跑：export SWEEP_DATASETS=768D1M SWEEP_NLIST_MULTS=0.25
 # ONLY_DIRS=... 可覆盖数据集子集。

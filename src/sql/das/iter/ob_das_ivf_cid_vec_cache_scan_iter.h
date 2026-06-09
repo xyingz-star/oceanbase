@@ -63,13 +63,27 @@ public:
       const ObIvfReplayNormRowKind kind);
   /// REPLAY serves rows from cache memory; no storage ObTableScanIterator (output_result_iter is null).
   static bool cid_vec_skips_storage_output_result_iter(ObDASScanIter *cid_vec_iter);
+  /// After finishing one probe cid: REPLAY keeps session pinned, skip full iter reuse.
+  static bool skip_inter_cid_full_reuse(ObDASScanIter *cid_vec_iter);
+  void prepare_for_next_cid_probe();
   static ObDASIvfCidVecCacheScanIter *get_active_iter() { return active_iter_; }
+  /// IVF_PQ REPLAY: flat blob is pinned and ready for zero-copy distance scan.
+  static bool pq_replay_flat_active(ObDASScanIter *cid_vec_iter);
+  /// IVF_FLAT REPLAY: flat blob is pinned and ready for zero-copy L2/IP distance scan.
+  static bool flat_ivf_replay_active(ObDASScanIter *cid_vec_iter);
+  bool get_replay_flat(const char *&flat_buf, int64_t &flat_len, int64_t &row_count) const;
+  bool get_pq_replay_flat(const char *&flat_buf, int64_t &flat_len, int64_t &row_count) const;
+  void add_replay_rows_served(int64_t row_cnt);
   void export_log_snapshot(share::ObIvfCidClusterCacheLogSnapshot &out) const;
   /// Reset per-query session counters and cache scan state (e.g. adaptive IVF retry).
   void reset_per_query_session_stats();
 
   virtual int do_table_scan() override;
   virtual int rescan() override;
+  /// Switch cid without parse_current_cid / do_aux_table_scan wrapper (REPLAY hot path).
+  int rescan_for_cid(uint64_t new_cid);
+  bool needs_storage_after_cid_switch() const;
+  int complete_storage_rescan();
 
 protected:
   virtual int inner_init(ObDASIterParam &param) override;

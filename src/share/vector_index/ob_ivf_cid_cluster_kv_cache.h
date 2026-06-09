@@ -146,6 +146,21 @@ int ivf_cid_flat_reopen_replay_entry(const char *flat_buf,
     const int64_t flat_len,
     ObIvfCidClusterEntry &entry);
 
+/// Zero-copy PQ/FLAT payload view from flat blob offset table.
+int ivf_cid_flat_replay_payload_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    const char *&payload,
+    int32_t &payload_len);
+
+/// Decode rowkey only (no payload / eval materialization).
+int ivf_cid_flat_replay_rowkey_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    common::ObObj *rk_scratch,
+    const int64_t rk_scratch_cap,
+    common::ObRowkey &out_rowkey);
+
 /// Materialize one row from flat blob; vector payload is zero-copy; rowkey decoded into rk_scratch.
 int ivf_cid_flat_replay_row_at(const char *flat_buf,
     const int64_t flat_len,

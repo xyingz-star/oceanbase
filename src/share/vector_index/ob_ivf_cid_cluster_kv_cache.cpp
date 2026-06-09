@@ -628,15 +628,15 @@ int ivf_cid_flat_reopen_replay_entry(const char *flat_buf, const int64_t flat_le
   return ret;
 }
 
-int ivf_cid_flat_replay_row_at(const char *flat_buf,
+int ivf_cid_flat_replay_payload_at(const char *flat_buf,
     const int64_t flat_len,
     const int64_t row_idx,
-    ObIvfCidClusterRow &out_row,
-    ObObj *rk_scratch,
-    const int64_t rk_scratch_cap)
+    const char *&payload,
+    int32_t &payload_len)
 {
   int ret = OB_SUCCESS;
-  out_row = ObIvfCidClusterRow();
+  payload = nullptr;
+  payload_len = 0;
   const ObIvfCidFlatHeader *hdr = nullptr;
   const int64_t *payload_off_tbl = nullptr;
   const int32_t *payload_len_tbl = nullptr;
@@ -647,12 +647,34 @@ int ivf_cid_flat_replay_row_at(const char *flat_buf,
   } else if (row_idx < 0 || row_idx >= hdr->row_count_) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else {
-    out_row.payload_type_ = static_cast<ObIvfCidClusterPayloadType>(hdr->payload_type_);
-    out_row.payload_len_ = payload_len_tbl[row_idx];
+    payload_len = payload_len_tbl[row_idx];
     const int64_t poff = payload_off_tbl[row_idx];
-    out_row.payload_ = (out_row.payload_len_ > 0 && poff >= 0 && poff + out_row.payload_len_ <= flat_len)
-        ? flat_buf + poff
-        : nullptr;
+    if (payload_len > 0 && poff >= 0 && poff + payload_len <= flat_len) {
+      payload = flat_buf + poff;
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_replay_rowkey_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    ObObj *rk_scratch,
+    const int64_t rk_scratch_cap,
+    ObRowkey &out_rowkey)
+{
+  int ret = OB_SUCCESS;
+  out_rowkey.reset();
+  const ObIvfCidFlatHeader *hdr = nullptr;
+  const int64_t *payload_off_tbl = nullptr;
+  const int32_t *payload_len_tbl = nullptr;
+  const int64_t *rowkey_off_tbl = nullptr;
+  const int32_t *rowkey_len_tbl = nullptr;
+  if (OB_FAIL(ivf_cid_flat_header_tables_(flat_buf, flat_len, hdr, payload_off_tbl, payload_len_tbl,
+          rowkey_off_tbl, rowkey_len_tbl))) {
+  } else if (row_idx < 0 || row_idx >= hdr->row_count_) {
+    ret = OB_ARRAY_OUT_OF_RANGE;
+  } else {
     const int32_t rk_len = rowkey_len_tbl[row_idx];
     const int64_t rk_off = rowkey_off_tbl[row_idx];
     if (rk_len < 0 || rk_off < 0 || rk_off + rk_len > flat_len) {
@@ -675,8 +697,37 @@ int ivf_cid_flat_replay_row_at(const char *flat_buf,
         if (OB_FAIL(ObTableSerialUtil::deserialize(flat_buf, flat_len, pos, rk))) {
           LOG_WARN("failed to deserialize rowkey", K(ret), K(row_idx));
         } else {
-          out_row.rowkey_ = rk;
+          out_rowkey = rk;
         }
+      }
+    }
+  }
+  return ret;
+}
+
+int ivf_cid_flat_replay_row_at(const char *flat_buf,
+    const int64_t flat_len,
+    const int64_t row_idx,
+    ObIvfCidClusterRow &out_row,
+    ObObj *rk_scratch,
+    const int64_t rk_scratch_cap)
+{
+  int ret = OB_SUCCESS;
+  out_row = ObIvfCidClusterRow();
+  const ObIvfCidFlatHeader *hdr = nullptr;
+  if (OB_ISNULL(flat_buf) || flat_len < static_cast<int64_t>(sizeof(ObIvfCidFlatHeader))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    hdr = reinterpret_cast<const ObIvfCidFlatHeader *>(flat_buf);
+    out_row.payload_type_ = static_cast<ObIvfCidClusterPayloadType>(hdr->payload_type_);
+    const char *payload_ptr = nullptr;
+    if (OB_FAIL(ivf_cid_flat_replay_payload_at(flat_buf, flat_len, row_idx, payload_ptr, out_row.payload_len_))) {
+      LOG_WARN("failed to replay flat payload", K(ret), K(row_idx));
+    } else {
+      out_row.payload_ = payload_ptr;
+      if (OB_FAIL(ivf_cid_flat_replay_rowkey_at(
+              flat_buf, flat_len, row_idx, rk_scratch, rk_scratch_cap, out_row.rowkey_))) {
+        LOG_WARN("failed to replay flat rowkey", K(ret), K(row_idx));
       }
     }
   }

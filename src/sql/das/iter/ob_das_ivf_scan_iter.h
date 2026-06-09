@@ -310,6 +310,8 @@ class ObIvfAadaptiveCtx
 
 /// IVF scan latency breakdown (microseconds).
 /// Enable with OB_IVF_LATENCY_BREAKDOWN=1 on observer.
+/// Daily fine-phase buckets: coarse_wall, fine_cv_storage_fetch, fine_load, fine_compute, fine_cv_untracked
+/// (fine_cv_untracked = fine_wall - storage_fetch - load - compute).
 /// Per-query stats (latency breakdown + cache session final) use a single pinned owner worker thread;
 /// see ob_das_ivf_per_query_stats.h. Other threads skip timers and file/observer stats logs.
 /// OB_IVF_LATENCY_BREAKDOWN_SAMPLE_EVERY_N=N (optional): on owner only, emit every N-th query (default 0 = every query).
@@ -338,19 +340,9 @@ struct ObIvfLatencyBreakdown {
     coarse_load_us_ = 0;
     coarse_compute_us_ = 0;
     fine_wall_us_ = 0;
+    fine_cv_storage_fetch_us_ = 0;
     fine_load_us_ = 0;
     fine_compute_us_ = 0;
-    fine_cv_prepare_us_ = 0;
-    fine_cv_probe_str_us_ = 0;
-    fine_cv_scan_open_us_ = 0;
-    fine_cv_storage_fetch_us_ = 0;
-    fine_cv_storage_fetch_first_batch_us_ = 0;
-    fine_cv_storage_fetch_other_batches_us_ = 0;
-    fine_cv_storage_fetch_max_batch_us_ = 0;
-    fine_cv_storage_fetch_batch_cnt_ = 0;
-    fine_cv_batch_expr_us_ = 0;
-    fine_cv_iter_reuse_us_ = 0;
-    fine_heap_finalize_us_ = 0;
     brute_wall_us_ = 0;
     sq8_prep_us_ = 0;
     pq_prep_us_ = 0;
@@ -369,31 +361,12 @@ struct ObIvfLatencyBreakdown {
   int64_t coarse_compute_us_{0};
   /// Per-iteration wall in fine phase: get_nearest_limit_rowkeys_in_cids + get_next_center_ids in same loop.
   int64_t fine_wall_us_{0};
-  /// Per-row split inside get_rowkeys_to_heap: load ≈ datum read / rowkey extraction; compute ≈ normalize / fused distance / heap push.
-  int64_t fine_load_us_{0};
-  int64_t fine_compute_us_{0};
-  /// Finer splits under fine_wall_us_ (mostly cid_vector retrieval path).
-  int64_t fine_cv_prepare_us_{0};
-  /// Per-probe overhead: cid buffer assign + center id to string before each get_rowkeys_to_heap().
-  int64_t fine_cv_probe_str_us_{0};
-  /// Per get_rowkeys_to_heap(): open scan range for cid_vector.
-  int64_t fine_cv_scan_open_us_{0};
-  /// Vectorized: sum of cid_vec_iter_->get_next_rows() per batch (storage / executor pull).
+  /// Vectorized: sum of cid_vec_iter_->get_next_rows() per batch (storage pull or cache replay_rows); REPLAY uses same path.
   int64_t fine_cv_storage_fetch_us_{0};
-  /// Sum of wall time for the **first** get_next_rows per cid_vec scan (each get_rowkeys_to_heap).
-  int64_t fine_cv_storage_fetch_first_batch_us_{0};
-  /// Sum of wall time for 2nd, 3rd, ... get_next_rows calls within those scans.
-  int64_t fine_cv_storage_fetch_other_batches_us_{0};
-  /// Max single-batch get_next_rows latency (microseconds).
-  int64_t fine_cv_storage_fetch_max_batch_us_{0};
-  /// Total number of get_next_rows calls (all probes / batches).
-  int64_t fine_cv_storage_fetch_batch_cnt_{0};
-  /// Vectorized only: per non-empty batch — eval scaffolding (guard, set_batch_size, locate_batch_datums); excludes per-row loop.
-  int64_t fine_cv_batch_expr_us_{0};
-  /// cid_vec iterator reuse_iter() at end of vectorized batches; serial scan iter reuse().
-  int64_t fine_cv_iter_reuse_us_{0};
-  /// After cid scan: nearest_rowkey_heap.get_nearest_probe_center_ids() into saved rowkeys (saved_rowkeys overload only).
-  int64_t fine_heap_finalize_us_{0};
+  /// Per-row load inside get_rowkeys_to_heap: datum read / rowkey extraction.
+  int64_t fine_load_us_{0};
+  /// Per-row compute: normalize, distance, heap push.
+  int64_t fine_compute_us_{0};
   int64_t brute_wall_us_{0};
   /// ObDASIvfSQ8ScanIter::process_ivf_scan_pre only: prep before do_ivf_scan_pre.
   int64_t sq8_prep_us_{0};
@@ -534,7 +507,13 @@ protected:
   int prepare_cid_range(const ObDASScanCtDef *cid_vec_ctdef, int64_t &cid_vec_column_count,
                         int64_t &cid_vec_pri_key_cnt, int64_t &rowkey_cnt);
   int scan_cid_range(const ObString &cid, int64_t cid_vec_pri_key_cnt, const ObDASScanCtDef *cid_vec_ctdef,
-                     ObDASScanRtDef *cid_vec_rtdef, storage::ObTableScanIterator *&cid_vec_scan_iter);
+                     ObDASScanRtDef *cid_vec_rtdef, storage::ObTableScanIterator *&cid_vec_scan_iter,
+                     const ObCenterId *center_id = nullptr);
+  /// REPLAY cache hit: rescan_for_cid only, skip build range + do_aux_table_scan / scan_cid_range wrapper.
+  /// Sets replay_only_handled=true when iter is ready to read rows (storage iter may stay null).
+  int try_cid_vec_replay_only_switch(const uint64_t cid_num,
+                                     storage::ObTableScanIterator *&cid_vec_scan_iter,
+                                     bool &replay_only_handled);
   int64_t get_nprobe(const common::ObLimitParam &limit_param, int64_t enlargement_factor = 1);
   int64_t get_heap_size(const int64_t limit_k, const double select_ratio);
   template <typename T>
@@ -606,6 +585,7 @@ protected:
   inline double get_default_selectivity_rate() const { return ObVecIdxExtraInfo::get_default_selectivity_rate(vec_index_param_.type_); }
   bool has_next_center(); // check if there are more centers available
   virtual void reuse_cid_ctx();
+  int reuse_cid_vec_iter_after_probe();
   int64_t get_cid_vec_batch_count();
   void ivf_lat_reset();
   void ivf_lat_log(const bool is_vectorized) const;
@@ -741,7 +721,8 @@ protected:
   int get_rowkeys_to_heap(const ObString &cid_str, int64_t cid_vec_pri_key_cnt, int64_t cid_vec_column_count,
                           int64_t rowkey_cnt, bool is_vectorized,
                           ObVectorCenterClusterHelper<T, ObRowkey> &nearest_rowkey_heap, bool &is_first_vec,
-                          bool &cid_vec_need_norm, ObIvfPreFilter *prefilter);
+                          bool &cid_vec_need_norm, ObIvfPreFilter *prefilter,
+                          const ObCenterId *center_id = nullptr);
   template <typename T>
   int get_nearest_limit_rowkeys_in_cids(bool is_vectorized, T *search_vec, ObSEArray<ObRowkey, 16> &saved_rowkeys, ObIvfPreFilter *prefilter);
   template <typename T>
