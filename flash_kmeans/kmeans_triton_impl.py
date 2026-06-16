@@ -5,6 +5,38 @@ from flash_kmeans.assign_euclid_triton import euclid_assign_triton, cosine_assig
 from flash_kmeans.centroid_update_triton import triton_centroid_update_cosine, triton_centroid_update_euclid, triton_centroid_update_sorted_euclid, triton_centroid_update_sorted_cosine
 from tqdm import trange
 
+# Triton tl.arange wants power-of-2 D; tl.dot (cosine assign) needs M,N,K >= 16.
+_TRITON_MIN_FEATURE_DIM = 16
+
+
+def _ceil_pow2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << ((n - 1).bit_length())
+
+
+def _triton_work_dim(d_orig: int) -> int:
+    return max(_ceil_pow2(d_orig), _TRITON_MIN_FEATURE_DIM)
+
+
+def _pad_features_for_triton(x, init_centroids=None):
+    """Zero-pad the last dim on device; preserves L2/cosine/dot semantics."""
+    d_orig = x.shape[-1]
+    d_work = _triton_work_dim(d_orig)
+    if d_work > d_orig:
+        pad = d_work - d_orig
+        x = F.pad(x, (0, pad))
+        if init_centroids is not None:
+            init_centroids = F.pad(init_centroids, (0, pad))
+    return x, init_centroids, d_orig
+
+
+def _trim_features(t, d_orig: int):
+    if t.shape[-1] > d_orig:
+        return t[..., :d_orig].contiguous()
+    return t
+
+
 # -------------------- Compiled single-iteration kernels --------------------
 
 # 1. Euclidean
@@ -76,6 +108,7 @@ def batch_kmeans_Euclid(
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
+    x, init_centroids, d_orig = _pad_features_for_triton(x, init_centroids)
     B, N, D = x.shape
 
     # Pre-compute squared L2 norm of all points (constant during iterations)
@@ -107,6 +140,7 @@ def batch_kmeans_Euclid(
             break
         centroids = centroids_new.clone()
 
+    centroids = _trim_features(centroids, d_orig)
     return cluster_ids, centroids, it + 1
 
 
@@ -138,6 +172,7 @@ def batch_kmeans_Cosine(
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
         centroids: (B, n_clusters, D) final cluster centers.
     """
+    x, init_centroids, d_orig = _pad_features_for_triton(x, init_centroids)
     B, N, D = x.shape
 
     # Normalize input vectors for cosine similarity (GPU)
@@ -170,6 +205,7 @@ def batch_kmeans_Cosine(
             break
         centroids = centroids_new.clone()
 
+    centroids = _trim_features(centroids, d_orig)
     return cluster_ids, centroids, it + 1
 
 
@@ -187,6 +223,7 @@ def batch_kmeans_Dot(
     Batched KMeans clustering in PyTorch using raw dot-product as similarity.
 
     """
+    x, init_centroids, d_orig = _pad_features_for_triton(x, init_centroids)
     B, N, D = x.shape
 
     if init_centroids is None:
@@ -215,6 +252,7 @@ def batch_kmeans_Dot(
             break
         centroids = centroids_new.clone()
 
+    centroids = _trim_features(centroids, d_orig)
     return cluster_ids, centroids, it + 1
 
 
