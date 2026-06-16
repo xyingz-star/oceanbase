@@ -350,6 +350,8 @@
  // Disable with OB_USE_TEST_FLASH_KMEANS=0 or false. Override command with OB_EXTERNAL_KMEANS_CMD.
  char g_ob_default_ext_kmeans_cmd[2048];
  bool g_ob_default_ext_kmeans_cmd_built = false;
+ char g_ob_default_ext_kmeans_pq_batch_cmd[2048];
+ bool g_ob_default_ext_kmeans_pq_batch_cmd_built = false;
 
  const char *ob_get_external_kmeans_cmd_or_default()
  {
@@ -386,13 +388,95 @@
    return (g_ob_default_ext_kmeans_cmd[0] != '\0') ? g_ob_default_ext_kmeans_cmd : nullptr;
  }
 
- ObKmeansAlgoType ob_resolve_kmeans_algo_type_from_env()
+ const char *ob_get_external_kmeans_pq_batch_cmd_or_default()
+ {
+   const char *manual = ::getenv("OB_EXTERNAL_KMEANS_PQ_BATCH_CMD");
+   if (OB_NOT_NULL(manual) && manual[0] != '\0') {
+     return manual;
+   }
+   if (!g_ob_default_ext_kmeans_pq_batch_cmd_built) {
+     g_ob_default_ext_kmeans_pq_batch_cmd_built = true;
+     g_ob_default_ext_kmeans_pq_batch_cmd[0] = '\0';
+     const char *home = ::getenv("HOME");
+     if (OB_NOT_NULL(home) && home[0] != '\0') {
+       char py[512];
+       char wk[512];
+       const int nw = snprintf(wk,
+           sizeof(wk),
+           "%s/test/oceanbase/tools/ob_external_kmeans_pq_batch_worker.py",
+           home);
+       if (nw > 0 && nw < static_cast<int>(sizeof(wk)) && 0 == ::access(wk, R_OK)) {
+         int npy = snprintf(py, sizeof(py), "%s/test/flash-kmeans/.venv311/bin/python3", home);
+         if (npy <= 0 || npy >= static_cast<int>(sizeof(py)) || 0 != ::access(py, X_OK)) {
+           (void)snprintf(py, sizeof(py), "%s/test/flash-kmeans/.venv/bin/python3", home);
+         }
+         if (0 == ::access(py, X_OK)) {
+           const int nc = snprintf(g_ob_default_ext_kmeans_pq_batch_cmd,
+               sizeof(g_ob_default_ext_kmeans_pq_batch_cmd),
+               "%s %s",
+               py,
+               wk);
+           if (nc <= 0 || nc >= static_cast<int>(sizeof(g_ob_default_ext_kmeans_pq_batch_cmd))) {
+             g_ob_default_ext_kmeans_pq_batch_cmd[0] = '\0';
+           }
+         }
+       }
+     }
+   }
+   return (g_ob_default_ext_kmeans_pq_batch_cmd[0] != '\0') ? g_ob_default_ext_kmeans_pq_batch_cmd : nullptr;
+ }
+
+ static bool ob_external_pq_batch_enabled_by_env()
+ {
+   const char *v = ::getenv("OB_EXTERNAL_KMEANS_PQ_BATCH");
+   if (OB_NOT_NULL(v) && v[0] != '\0') {
+     if ((0 == strcmp(v, "0")) || (0 == strcasecmp(v, "false")) || (0 == strcasecmp(v, "off")) ||
+         (0 == strcasecmp(v, "no"))) {
+       return false;
+     }
+   }
+   return OB_NOT_NULL(ob_get_external_kmeans_pq_batch_cmd_or_default());
+ }
+
+ static int ob_external_pq_micro_batch_from_env()
+ {
+   const char *e = ::getenv("OB_EXTERNAL_KMEANS_PQ_MICRO_BATCH");
+   if (OB_NOT_NULL(e) && e[0] != '\0') {
+     const int v = atoi(e);
+     if (v >= 1 && v <= 256) {
+       return v;
+     }
+   }
+   return 16;
+ }
+
+ static bool ob_external_kmeans_stage_disabled_by_env(const char *env_name)
+ {
+   const char *v = ::getenv(env_name);
+   return OB_NOT_NULL(v) && v[0] != '\0'
+       && ((0 == strcmp(v, "0")) || (0 == strcasecmp(v, "false")) || (0 == strcasecmp(v, "off"))
+           || (0 == strcasecmp(v, "no")));
+ }
+
+ // is_pq_stage: false = IVF coarse (ObIvfFlatBuildHelper), true = PQ codebook (ObIvfPqBuildHelper).
+ // OB_USE_TEST_FLASH_KMEANS=0 -> both stages Elkan.
+ // OB_EXTERNAL_KMEANS_IVF=0 -> coarse stays Elkan; PQ still external if worker present (unless OB_EXTERNAL_KMEANS_PQ=0).
+ // OB_EXTERNAL_KMEANS_PQ=0 -> PQ stays Elkan; coarse still external if worker present (unless OB_EXTERNAL_KMEANS_IVF=0).
+ ObKmeansAlgoType ob_resolve_kmeans_algo_type_from_env(const bool is_pq_stage)
  {
    const char *opt_out = ::getenv("OB_USE_TEST_FLASH_KMEANS");
    if (OB_NOT_NULL(opt_out) && opt_out[0] != '\0') {
      if ((0 == strcmp(opt_out, "0")) || (0 == strcasecmp(opt_out, "false")) || (0 == strcasecmp(opt_out, "off"))) {
        return ObKmeansAlgoType::KAT_ELKAN;
      }
+   }
+   if (is_pq_stage && ob_external_kmeans_stage_disabled_by_env("OB_EXTERNAL_KMEANS_PQ")) {
+     kmeans_log("external_kmeans: OB_EXTERNAL_KMEANS_PQ disabled -> PQ codebook uses Elkan (CPU)");
+     return ObKmeansAlgoType::KAT_ELKAN;
+   }
+   if (!is_pq_stage && ob_external_kmeans_stage_disabled_by_env("OB_EXTERNAL_KMEANS_IVF")) {
+     kmeans_log("external_kmeans: OB_EXTERNAL_KMEANS_IVF disabled -> IVF coarse uses Elkan (CPU)");
+     return ObKmeansAlgoType::KAT_ELKAN;
    }
    if (OB_NOT_NULL(ob_get_external_kmeans_cmd_or_default())) {
      return ObKmeansAlgoType::KAT_EXTERNAL_GPU;
@@ -406,6 +490,80 @@
  // Worker-side k-means++ init flag; default ON (set OB_EXTERNAL_GPU_KMEANSPP=0|false|off|no to use OB CPU k-means++).
  // Must match tools/ob_external_kmeans_worker.py
  constexpr uint32_t OB_EXT_KMEANS_FLAG_WORKER_GPU_KMEANSPP = 1U << 1;
+
+ // PQ batch worker (ob_external_kmeans_pq_batch_worker.py): one N×full_dim transfer, micro-batch GPU Lloyd.
+ constexpr uint32_t OB_EXT_KMEANS_PQ_BATCH_MAGIC = 0x424B424FU;  // 'OBKB' LE
+ constexpr uint32_t OB_EXT_KMEANS_PQ_BATCH_VERSION = 1U;
+
+#pragma pack(push, 1)
+ struct ObExtKmeansPqBatchInHeader
+ {
+   uint32_t magic_;
+   uint32_t version_;
+   int64_t n_samples_;
+   int64_t full_dim_;
+   int64_t m_;
+   int64_t sub_dim_;
+   int64_t k_;
+   int32_t max_iters_;
+   int32_t micro_batch_;
+   uint32_t flags_;
+ };
+ struct ObExtKmeansPqBatchOutHeader
+ {
+   uint32_t magic_;
+   uint32_t version_;
+   int64_t m_;
+   int64_t k_;
+   int64_t sub_dim_;
+ };
+#pragma pack(pop)
+
+ int write_ob_external_kmeans_pq_batch_input(
+     const char *path,
+     const ObIArray<float *> &full_vectors,
+     const int64_t full_dim,
+     const int64_t m,
+     const int64_t sub_dim,
+     const int64_t k,
+     const int max_iters,
+     const int micro_batch,
+     const bool worker_gpu_kmeanspp)
+ {
+   int ret = OB_SUCCESS;
+   FILE *fp = fopen(path, "wb");
+   if (OB_ISNULL(fp)) {
+     ret = OB_IO_ERROR;
+     SHARE_LOG(WARN, "fopen pq batch input failed", K(ret), KP(path));
+   } else {
+     ObExtKmeansPqBatchInHeader hdr;
+     hdr.magic_ = OB_EXT_KMEANS_PQ_BATCH_MAGIC;
+     hdr.version_ = OB_EXT_KMEANS_PQ_BATCH_VERSION;
+     hdr.n_samples_ = full_vectors.count();
+     hdr.full_dim_ = full_dim;
+     hdr.m_ = m;
+     hdr.sub_dim_ = sub_dim;
+     hdr.k_ = k;
+     hdr.max_iters_ = max_iters;
+     hdr.micro_batch_ = micro_batch;
+     hdr.flags_ = worker_gpu_kmeanspp ? OB_EXT_KMEANS_FLAG_WORKER_GPU_KMEANSPP : 0U;
+     if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) {
+       ret = OB_IO_ERROR;
+       SHARE_LOG(WARN, "fwrite pq batch header failed", K(ret));
+     }
+     for (int64_t i = 0; OB_SUCC(ret) && i < full_vectors.count(); ++i) {
+       if (fwrite(full_vectors.at(i), sizeof(float) * static_cast<size_t>(full_dim), 1, fp) != 1) {
+         ret = OB_IO_ERROR;
+         SHARE_LOG(WARN, "fwrite pq batch sample failed", K(ret), K(i));
+       }
+     }
+     if (0 != fclose(fp)) {
+       ret = OB_SUCC(ret) ? OB_IO_ERROR : ret;
+       SHARE_LOG(WARN, "fclose pq batch input failed", K(ret));
+     }
+   }
+   return ret;
+ }
 
 #pragma pack(push, 1)
  struct ObExtKmeansInHeader
@@ -751,7 +909,34 @@
    }
    return ret;
  }
- 
+
+ int ObKmeansAlgo::load_finished_centers(const float *rows, const int64_t k, const int64_t dim)
+ {
+   int ret = OB_SUCCESS;
+   if (IS_NOT_INIT) {
+     ret = OB_NOT_INIT;
+     SHARE_LOG(WARN, "kmeans algo is not inited", K(ret));
+   } else if (OB_ISNULL(rows) || k <= 0 || dim <= 0) {
+     ret = OB_INVALID_ARGUMENT;
+     SHARE_LOG(WARN, "invalid load_finished_centers args", K(ret), KP(rows), K(k), K(dim));
+   } else if (OB_FAIL(centers_[0].init(dim, k, ivf_build_mem_ctx_))) {
+     SHARE_LOG(WARN, "failed to init centers buffer", K(ret));
+   } else if (OB_FAIL(centers_[1].init(dim, k, ivf_build_mem_ctx_))) {
+     SHARE_LOG(WARN, "failed to init alt centers buffer", K(ret));
+   } else {
+     for (int64_t i = 0; OB_SUCC(ret) && i < k; ++i) {
+       if (OB_FAIL(centers_[0].push_back(dim, const_cast<float *>(rows + i * dim)))) {
+         SHARE_LOG(WARN, "failed to push_back external center row", K(ret), K(i));
+       }
+     }
+     if (OB_SUCC(ret)) {
+       cur_idx_ = 0;
+       status_ = FINISH;
+     }
+   }
+   return ret;
+ }
+
  int ObKmeansAlgo::inner_build(const ObIArray<float*> &input_vectors)
  {
    int ret = OB_SUCCESS;
@@ -1287,12 +1472,21 @@
      const int64_t pq_m_size/* = 1*/)
  {
    int ret = OB_SUCCESS;
+   algo_type_ = algo_type;
+   use_external_pq_batch_ = false;
    if (OB_FAIL(ctx_.init(tenant_id, lists, samples_per_nlist, dim, dist_algo, norm_info, pq_m_size, true /* is_pq_stage */))) {
      LOG_WARN("fail to init kmeans ctx", K(ret), K(tenant_id), K(lists), K(samples_per_nlist), K(dim), K(dist_algo));
    } else {
      if (algo_type == ObKmeansAlgoType::KAT_EXTERNAL_GPU) {
        ctx_.set_train_strategy(KTS_FULL_BATCH);
        kmeans_log("external_kmeans: train_strategy set to FULL_BATCH (external worker does not support NMBKM)");
+       if (pq_m_size > 1 && ob_external_pq_batch_enabled_by_env()) {
+         use_external_pq_batch_ = true;
+         kmeans_log(
+             "external_kmeans: PQ batch worker enabled m=%ld micro_batch=%d (OB_EXTERNAL_KMEANS_PQ_BATCH=0 to disable)",
+             pq_m_size,
+             ob_external_pq_micro_batch_from_env());
+       }
      }
      pq_m_size_ = pq_m_size;
      if (OB_FAIL(algos_.prepare_allocate(pq_m_size))) {
@@ -1338,6 +1532,10 @@
    if (IS_NOT_INIT) {
      ret = OB_NOT_INIT;
      SHARE_LOG(WARN, "kmeans ctx is not inited", K(ret));
+   } else if (use_external_pq_batch_) {
+     if (OB_FAIL(build_external_pq_batch(insert_monitor))) {
+       LOG_WARN("fail to build external pq batch", K(ret));
+     }
    } else {
      int64_t start_time = ObTimeUtil::current_time_ms();
      ObArenaAllocator tmp_alloc("MulKmeans", OB_MALLOC_NORMAL_BLOCK_SIZE, ctx_.tenant_id_);
@@ -1374,7 +1572,184 @@
  
    return ret;
  }
- 
+
+ int ObMultiKmeansExecutor::build_external_pq_batch(ObInsertMonitor *insert_monitor)
+ {
+   int ret = OB_SUCCESS;
+   char in_template[] = "/tmp/ob_ext_km_pq_in_XXXXXX";
+   char out_template[] = "/tmp/ob_ext_km_pq_out_XXXXXX";
+   int in_fd = ::mkstemp(in_template);
+   int out_fd = ::mkstemp(out_template);
+   const int64_t wall_t0_ms = ObTimeUtility::current_time_ms();
+   if (IS_NOT_INIT) {
+     ret = OB_NOT_INIT;
+     SHARE_LOG(WARN, "kmeans ctx is not inited", K(ret));
+   } else if (in_fd < 0 || out_fd < 0) {
+     ret = OB_IO_ERROR;
+     SHARE_LOG(WARN, "mkstemp pq batch failed", K(ret), K(in_fd), K(out_fd));
+   } else {
+     ::close(out_fd);
+     out_fd = -1;
+     ::close(in_fd);
+     in_fd = -1;
+     const char *cmd = ob_get_external_kmeans_pq_batch_cmd_or_default();
+     const int max_iters = ob_external_kmeans_max_iters_from_env();
+     const int micro_batch = ob_external_pq_micro_batch_from_env();
+     const int64_t n = ctx_.sample_vectors_.count();
+     const int64_t full_dim = ctx_.sample_dim_;
+     const int64_t sub_dim = ctx_.dim_;
+     const int64_t k = ctx_.lists_;
+     const int64_t m = pq_m_size_;
+     const bool gpu_kpp = ob_external_gpu_kmeanspp_enabled();
+     if (OB_ISNULL(cmd) || cmd[0] == '\0') {
+       ret = OB_ERR_UNEXPECTED;
+       kmeans_log("external_pq_batch_fail reason=cmd_empty");
+     } else if (n <= 0 || full_dim <= 0 || sub_dim <= 0 || k <= 0 || m <= 0) {
+       ret = OB_INVALID_ARGUMENT;
+       kmeans_log("external_pq_batch_fail reason=invalid_dims n=%ld full_dim=%ld m=%ld sub_dim=%ld k=%ld",
+           n,
+           full_dim,
+           m,
+           sub_dim,
+           k);
+     } else if (full_dim != m * sub_dim) {
+       ret = OB_INVALID_ARGUMENT;
+       kmeans_log("external_pq_batch_fail reason=full_dim_mismatch full_dim=%ld m=%ld sub_dim=%ld",
+           full_dim,
+           m,
+           sub_dim);
+     } else if (pq_m_size_ != algos_.count()) {
+       ret = OB_ERR_UNEXPECTED;
+       LOG_WARN("algos count mismatch", K(ret), K(pq_m_size_), K(algos_.count()));
+     } else {
+       const int64_t write_t0_ms = ObTimeUtility::current_time_ms();
+       if (OB_FAIL(write_ob_external_kmeans_pq_batch_input(
+                      in_template,
+                      ctx_.sample_vectors_,
+                      full_dim,
+                      m,
+                      sub_dim,
+                      k,
+                      max_iters,
+                      micro_batch,
+                      gpu_kpp))) {
+         SHARE_LOG(WARN, "write pq batch input failed", K(ret));
+         kmeans_log("external_pq_batch_fail reason=write_input ret=%d", ret);
+       } else {
+         kmeans_log(
+             "external_pq_batch_invoke n=%ld m=%ld sub_dim=%ld k=%ld max_iters=%d micro_batch=%d gpu_kpp=%d "
+             "write_ms=%ld in=%s out=%s",
+             n,
+             m,
+             sub_dim,
+             k,
+             max_iters,
+             micro_batch,
+             gpu_kpp ? 1 : 0,
+             ObTimeUtility::current_time_ms() - write_t0_ms,
+             in_template,
+             out_template);
+         if (OB_ISNULL(::getenv("USE_FLASH_KMEANS")) && OB_NOT_NULL(std::strstr(cmd, "flash-kmeans"))) {
+           (void)::setenv("USE_FLASH_KMEANS", "1", 0);
+         }
+         char cmdline[2048];
+         const int ncmd = snprintf(cmdline, sizeof(cmdline), "%s \"%s\" \"%s\"", cmd, in_template, out_template);
+         if (ncmd <= 0 || ncmd >= static_cast<int>(sizeof(cmdline))) {
+           ret = OB_ERR_UNEXPECTED;
+           kmeans_log("external_pq_batch_fail reason=cmdline_too_long n=%d", ncmd);
+         } else {
+           const int64_t sys_t0_ms = ObTimeUtility::current_time_ms();
+           const int sys_ret = ::system(cmdline);
+           kmeans_log(
+               "external_pq_batch_system_return sys_ret=%d system_elapsed_ms=%ld",
+               sys_ret,
+               ObTimeUtility::current_time_ms() - sys_t0_ms);
+           if (sys_ret != 0) {
+             ret = OB_ERR_UNEXPECTED;
+             SHARE_LOG(WARN, "pq batch worker failed", K(ret), K(sys_ret), K(cmdline));
+           }
+         }
+       }
+     }
+
+     if (OB_SUCC(ret)) {
+       FILE *fp = fopen(out_template, "rb");
+       if (OB_ISNULL(fp)) {
+         ret = OB_IO_ERROR;
+         kmeans_log("external_pq_batch_fail reason=fopen_output");
+       } else {
+         ObExtKmeansPqBatchOutHeader hdr;
+         if (fread(&hdr, sizeof(hdr), 1, fp) != 1) {
+           ret = OB_IO_ERROR;
+           kmeans_log("external_pq_batch_fail reason=fread_output_header");
+         } else if (hdr.magic_ != OB_EXT_KMEANS_PQ_BATCH_MAGIC || hdr.version_ != OB_EXT_KMEANS_PQ_BATCH_VERSION) {
+           ret = OB_ERR_UNEXPECTED;
+           kmeans_log("external_pq_batch_fail reason=bad_output_magic ver=%u", hdr.version_);
+         } else if (hdr.m_ != m || hdr.k_ != k || hdr.sub_dim_ != sub_dim) {
+           ret = OB_ERR_UNEXPECTED;
+           kmeans_log("external_pq_batch_fail reason=output_shape_mismatch out_m=%ld out_k=%ld out_sub=%ld",
+               hdr.m_,
+               hdr.k_,
+               hdr.sub_dim_);
+         } else {
+           const size_t row_floats = static_cast<size_t>(sub_dim);
+           const size_t block_floats = static_cast<size_t>(k) * row_floats;
+           std::vector<float> row_buf(block_floats);
+           for (int64_t si = 0; OB_SUCC(ret) && si < m; ++si) {
+             if (fread(row_buf.data(), sizeof(float), block_floats, fp) != block_floats) {
+               ret = OB_IO_ERROR;
+               kmeans_log("external_pq_batch_fail reason=fread_subspace si=%ld", si);
+             } else if (OB_ISNULL(algos_.at(si))) {
+               ret = OB_ERR_UNEXPECTED;
+             } else if (OB_FAIL(algos_.at(si)->load_finished_centers(row_buf.data(), k, sub_dim))) {
+               LOG_WARN("load_finished_centers failed", K(ret), K(si));
+             } else if (OB_NOT_NULL(insert_monitor) &&
+                        OB_NOT_NULL(insert_monitor->kmeans_monitor_.vec_index_task_finish_cnt_)) {
+               (void)ATOMIC_AAF(insert_monitor->kmeans_monitor_.vec_index_task_finish_cnt_, 1);
+             }
+             if (OB_NOT_NULL(algos_.at(si))) {
+               algos_.at(si)->destroy();
+             }
+           }
+         }
+         (void)fclose(fp);
+       }
+     }
+     (void)::unlink(in_template);
+     (void)::unlink(out_template);
+   }
+   if (in_fd >= 0) {
+     ::close(in_fd);
+   }
+   if (out_fd >= 0) {
+     ::close(out_fd);
+   }
+   if (OB_NOT_NULL(insert_monitor)) {
+     if (OB_NOT_NULL(insert_monitor->kmeans_monitor_.vec_index_task_total_cnt_)) {
+       (void)ATOMIC_AAF(insert_monitor->kmeans_monitor_.vec_index_task_total_cnt_, pq_m_size_);
+     }
+     if (OB_NOT_NULL(insert_monitor->kmeans_monitor_.vec_index_task_thread_pool_cnt_)) {
+       (void)ATOMIC_SET(insert_monitor->kmeans_monitor_.vec_index_task_thread_pool_cnt_, 1);
+     }
+     if (OB_SUCC(ret)) {
+       insert_monitor->kmeans_monitor_.add_finish_tablet_cnt();
+     }
+   }
+   if (OB_SUCC(ret)) {
+     kmeans_log(
+         "external_pq_batch_done n=%ld m=%ld sub_dim=%ld k=%ld wall_elapsed_ms=%ld",
+         ctx_.sample_vectors_.count(),
+         pq_m_size_,
+         ctx_.dim_,
+         ctx_.lists_,
+         ObTimeUtility::current_time_ms() - wall_t0_ms);
+   }
+   LOG_INFO("MultiKmeans external pq batch cost",
+       K(ret),
+       K(ObTimeUtility::current_time_ms() - wall_t0_ms));
+   return ret;
+ }
+
  int ObMultiKmeansExecutor::prepare_splited_arrs(ObArrayArray<float *> &splited_arrs)
  {
    int ret = OB_SUCCESS;
@@ -1496,6 +1871,10 @@
    if (IS_NOT_INIT) {
      ret = OB_NOT_INIT;
      LOG_WARN("kmeans ctx is not inited", K(ret));
+   } else if (use_external_pq_batch_) {
+     if (OB_FAIL(build_external_pq_batch(insert_monitor))) {
+       LOG_WARN("fail to build external pq batch", K(ret));
+     }
    } else {
      int64_t start_time = ObTimeUtil::current_time_ms();
      LOG_INFO("start build_parallel", K(table_id), K(tablet_id), K(ctx_));
@@ -1711,6 +2090,11 @@
      const bool gpu_kpp = ob_external_gpu_kmeanspp_enabled();
      const bool write_init = !gpu_kpp && (centers_[cur_idx_].count() == k);
      int64_t external_kmeans_wall_t0_ms = 0;
+     const int32_t ctx_dist_algo = static_cast<int32_t>(kmeans_ctx_->dist_algo_);
+     // PQ codebook: OB Elkan clusters raw subvectors with L2 (faiss-style); do not forward index-level COS.
+     const int32_t worker_dist_algo = kmeans_ctx_->is_pq_stage_
+         ? static_cast<int32_t>(VIDA_L2)
+         : ctx_dist_algo;
      if (OB_ISNULL(cmd) || cmd[0] == '\0') {
        ret = OB_ERR_UNEXPECTED;
        SHARE_LOG(WARN, "external kmeans cmd empty (set OB_EXTERNAL_KMEANS_CMD or install $HOME/test/flash-kmeans + worker)",
@@ -1732,13 +2116,19 @@
        in_fd = -1;
        row_buf.resize(static_cast<size_t>(dim));
        const int64_t write_input_t0_ms = ObTimeUtility::current_time_ms();
+       if (kmeans_ctx_->is_pq_stage_ && ctx_dist_algo != worker_dist_algo) {
+         kmeans_log(
+             "external_kmeans: PQ stage worker dist_algo=%d (index dist_algo=%d -> L2 for faiss/Elkan parity)",
+             worker_dist_algo,
+             ctx_dist_algo);
+       }
        if (OB_FAIL(write_ob_external_kmeans_input(
                       in_template,
                       input_vectors,
                       centers_[cur_idx_],
                       k,
                       dim,
-                      static_cast<int32_t>(kmeans_ctx_->dist_algo_),
+                      worker_dist_algo,
                       max_iters,
                       write_init,
                       gpu_kpp))) {
@@ -1750,7 +2140,7 @@
              "external_kmeans_write_input_ms=%ld in=%s",
              write_input_ms,
              in_template);
-         const int32_t dist_algo_i = static_cast<int32_t>(kmeans_ctx_->dist_algo_);
+         const int32_t dist_algo_i = worker_dist_algo;
          kmeans_log(
              "external_kmeans_invoke n=%ld k=%ld dim=%ld dist_algo=%d max_iters=%d write_init=%d gpu_kmeanspp=%d in=%s out=%s",
              input_vectors.count(),
@@ -1872,7 +2262,7 @@
            dim,
            input_vectors.count(),
            max_iters,
-           static_cast<int32_t>(kmeans_ctx_->dist_algo_),
+           static_cast<int32_t>(worker_dist_algo),
            wall_ms);
      }
    }
@@ -3762,7 +4152,7 @@
  int ObIvfFlatBuildHelper::init_kmeans_ctx(const int64_t dim)
  {
    int ret = OB_SUCCESS;
-   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env();
+   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env(false /* ivf coarse */);
    void *buf = nullptr;
    ObVectorNormalizeInfo *norm_info = nullptr;
    if (OB_NOT_NULL(executor_)) {
@@ -3912,8 +4302,8 @@
  int ObIvfPqBuildHelper::init_kmeans_ctx(const int64_t dim)
  {
    int ret = OB_SUCCESS;
-   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env();
- 
+   ObKmeansAlgoType algo_type = ob_resolve_kmeans_algo_type_from_env(true /* pq codebook */);
+
    void *buf = nullptr;
    int64_t pqnlist = 0;
    int64_t sample_per_nlist = 0;

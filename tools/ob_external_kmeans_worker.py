@@ -252,7 +252,7 @@ def _kmeans_plus_plus_numpy(x, k, dist_algo):
 
 
 def _gpu_kmeans_plus_plus_torch(x, k, dist_algo, device):
-    """k-means++ init on device; x is float32 numpy (n,d), possibly padded. Returns (k,d) float32 CPU.
+    """k-means++ init on device; x is float32 numpy (n,d). Returns (k,d) float32 CPU.
 
     Uses incremental min squared distance (O(k*n*d) memory O(n*d)), not a full (n,m,d) diff tensor, to avoid OOM when k is large.
 
@@ -411,23 +411,8 @@ def _gpu_kmeans_plus_plus_native(x, k, dist_algo):
     return out
 
 
-def _ceil_pow2(n):
-    """Smallest power of 2 >= n (n >= 1). Triton tl.arange(0, D) in flash-kmeans needs Po2 D."""
-    if n <= 1:
-        return 1
-    return 1 << ((n - 1).bit_length())
-
-
 def _try_flash_kmeans(x, k, max_iters, init, dist_algo, worker_kpp=False):
     import numpy as np
-
-    _, d_orig = x.shape
-    d_pad = _ceil_pow2(d_orig)
-    if d_pad > d_orig:
-        _prof("flash: pad dim %d -> %d (Triton requires power-of-2 D)" % (d_orig, d_pad))
-        x = np.pad(x, ((0, 0), (0, d_pad - d_orig)), mode="constant", constant_values=0)
-        if init is not None:
-            init = np.pad(init, ((0, 0), (0, d_pad - d_orig)), mode="constant", constant_values=0)
 
     _prof("flash: import torch + flash_kmeans (cold start may be slow)")
     import torch
@@ -473,11 +458,12 @@ def _try_flash_kmeans(x, k, max_iters, init, dist_algo, worker_kpp=False):
             init = _gpu_kmeans_plus_plus_torch(x, k, dist_algo, dev)
             _prof("flash: k-means++ path=pytorch")
         _prof("flash: k-means++ init done in %.1fms" % ((time.perf_counter() - t0) * 1000.0,))
-    x_t = torch.as_tensor(x, dtype=torch.float16, device=dev).unsqueeze(0)
+    # Match OB Elkan / bin I/O: float32 end-to-end (flash-kmeans Triton supports fp32).
+    x_t = torch.as_tensor(x, dtype=torch.float32, device=dev).unsqueeze(0)
     ic = None
     if init is not None:
-        ic = torch.as_tensor(init, dtype=torch.float16, device=dev).unsqueeze(0)
-    _prof("flash: tensors on device (H2D done if CUDA)")
+        ic = torch.as_tensor(init, dtype=torch.float32, device=dev).unsqueeze(0)
+    _prof("flash: tensors on device dtype=float32 (H2D done if CUDA)")
     if dist_algo == VIDA_L2:
         fn = batch_kmeans_Euclid
     elif dist_algo == VIDA_IP:
@@ -492,9 +478,7 @@ def _try_flash_kmeans(x, k, max_iters, init, dist_algo, worker_kpp=False):
     )
     _prof("flash: batch_kmeans done")
     out = centroids[0].float().detach().cpu().numpy()
-    if d_pad > d_orig:
-        out = np.ascontiguousarray(out[:, :d_orig])
-    _prof("flash: centroids D2H + numpy done (trimmed to dim=%d)" % d_orig)
+    _prof("flash: centroids D2H + numpy done (dim=%d)" % out.shape[1])
     return out
 
 

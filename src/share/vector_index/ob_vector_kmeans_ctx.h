@@ -137,6 +137,8 @@ public:
   // ivfpq enable_parallel is false, because ivf_dim is small, there is no need for parallel kmeans.
   int init(ObKmeansCtx &kmeans_ctx, bool enable_parallel = false);
   int build(const ObIArray<float*> &input_vectors);
+  /** Load k centroid rows (dim floats each) and mark build FINISH (external PQ batch path). */
+  int load_finished_centers(const float *rows, const int64_t k, const int64_t dim);
   bool is_finish() const { return FINISH == status_; }
   int64_t next_idx() { return 1L - cur_idx_; }
   ObCentersBuffer<float> &get_cur_centers() { return centers_[cur_idx_]; }
@@ -353,7 +355,10 @@ class ObKmeansDistanceCalcTask;
 class ObMultiKmeansExecutor : public ObKmeansExecutor
 {
 public:
-  ObMultiKmeansExecutor(ObIvfMemContext &ivf_build_mem_ctx) : ObKmeansExecutor(ivf_build_mem_ctx), pq_m_size_(0) {
+  ObMultiKmeansExecutor(ObIvfMemContext &ivf_build_mem_ctx) : ObKmeansExecutor(ivf_build_mem_ctx),
+      pq_m_size_(0),
+      algo_type_(ObKmeansAlgoType::KAT_ELKAN),
+      use_external_pq_batch_(false) {
     algos_.set_attr(ObMemAttr(MTL_ID(), "MKmeansExu"));
   }
   virtual ~ObMultiKmeansExecutor();
@@ -392,9 +397,12 @@ private:
   int do_build_task_local(const common::ObTableID &table_id, const common::ObTabletID &tablet_id,
                           ObKmeansBuildTaskHandler &handle, const ObArrayArray<float *> &splited_arrs,
                           ObKmeansBuildTask *build_tasks, int task_idx, ObInsertMonitor *insert_monitor);
+  int build_external_pq_batch(ObInsertMonitor *insert_monitor);
 
 private:
   int pq_m_size_;
+  ObKmeansAlgoType algo_type_;
+  bool use_external_pq_batch_;
   ObSEArray<ObKmeansAlgo *, 4> algos_;
 };
 
