@@ -146,6 +146,31 @@ int ivf_cid_flat_reopen_replay_entry(const char *flat_buf,
     const int64_t flat_len,
     ObIvfCidClusterEntry &entry);
 
+/// Parsed ICFL offset tables; valid for one pinned flat blob (one REPLAY cid).
+struct ObIvfCidFlatReplayTableView
+{
+  const ObIvfCidFlatHeader *hdr_;
+  const int64_t *payload_off_tbl_;
+  const int32_t *payload_len_tbl_;
+  const int64_t *rowkey_off_tbl_;
+  const int32_t *rowkey_len_tbl_;
+  int64_t flat_len_;
+  void reset()
+  {
+    hdr_ = nullptr;
+    payload_off_tbl_ = nullptr;
+    payload_len_tbl_ = nullptr;
+    rowkey_off_tbl_ = nullptr;
+    rowkey_len_tbl_ = nullptr;
+    flat_len_ = 0;
+  }
+  bool valid() const { return OB_NOT_NULL(hdr_) && hdr_->row_count_ > 0 && flat_len_ > 0; }
+};
+
+int ivf_cid_flat_open_replay_table_view(const char *flat_buf,
+    const int64_t flat_len,
+    ObIvfCidFlatReplayTableView &view);
+
 /// Zero-copy PQ/FLAT payload view from flat blob offset table.
 int ivf_cid_flat_replay_payload_at(const char *flat_buf,
     const int64_t flat_len,

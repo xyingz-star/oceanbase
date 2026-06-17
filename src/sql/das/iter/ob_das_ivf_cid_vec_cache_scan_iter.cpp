@@ -15,6 +15,7 @@
 #include "sql/das/iter/ob_das_ivf_cid_vec_cache_scan_iter.h"
 #include "sql/das/iter/ob_das_ivf_per_query_stats.h"
 #include "share/vector_index/ob_ivf_cid_cluster_kv_cache.h"
+#include "sql/engine/expr/ob_expr.h"
 #include "sql/engine/expr/ob_expr_util.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -60,9 +61,14 @@ ObDASIvfCidVecCacheScanIter::ObDASIvfCidVecCacheScanIter()
     building_cluster_(),
     cid_fill_leader_(false),
     materialized_batch_cnt_(0),
+    lazy_replay_payload_(false),
     cache_was_active_(false)
 {
   MEMSET(materialized_batch_, 0, sizeof(materialized_batch_));
+  for (int64_t i = 0; i < MATERIALIZED_BATCH_CAP; ++i) {
+    materialized_batch_row_idx_[i] = -1;
+  }
+  replay_flat_view_.reset();
   session_stats_.reset();
 }
 
@@ -305,6 +311,47 @@ void ObDASIvfCidVecCacheScanIter::add_replay_rows_served(int64_t row_cnt)
 void ObDASIvfCidVecCacheScanIter::clear_materialized_batch()
 {
   materialized_batch_cnt_ = 0;
+  for (int64_t i = 0; i < MATERIALIZED_BATCH_CAP; ++i) {
+    materialized_batch_row_idx_[i] = -1;
+  }
+}
+
+void ObDASIvfCidVecCacheScanIter::clear_replay_flat_table_view()
+{
+  replay_flat_view_.reset();
+  lazy_replay_payload_ = false;
+}
+
+bool ObDASIvfCidVecCacheScanIter::is_ivf_cache_lazy_replay_algo(ObVectorIndexAlgorithmType algo)
+{
+  return algo == ObVectorIndexAlgorithmType::VIAT_IVF_FLAT
+      || algo == ObVectorIndexAlgorithmType::VIAT_IVF_SQ8
+      || algo == ObVectorIndexAlgorithmType::VIAT_IVF_PQ;
+}
+
+bool ObDASIvfCidVecCacheScanIter::use_lazy_replay_payload() const
+{
+  return lazy_replay_payload_ && mode_ == ScanMode::REPLAY && replay_flat_view_.valid()
+      && is_ivf_cache_lazy_replay_algo(algo_);
+}
+
+int ObDASIvfCidVecCacheScanIter::bind_replay_flat_table_view()
+{
+  int ret = OB_SUCCESS;
+  clear_replay_flat_table_view();
+  if (mode_ != ScanMode::REPLAY || !is_ivf_cache_lazy_replay_algo(algo_)
+      || OB_ISNULL(replay_entry_) || OB_ISNULL(replay_entry_->kv_flat_buf_)) {
+  } else {
+    const share::ObIvfCidFlatHeader *hdr =
+        reinterpret_cast<const share::ObIvfCidFlatHeader *>(replay_entry_->kv_flat_buf_);
+    if (OB_FAIL(share::ivf_cid_flat_open_replay_table_view(
+            replay_entry_->kv_flat_buf_, hdr->flat_buf_len_, replay_flat_view_))) {
+      LOG_WARN("failed to open replay table view", K(ret));
+    } else {
+      lazy_replay_payload_ = true;
+    }
+  }
+  return ret;
 }
 
 void ObDASIvfCidVecCacheScanIter::mark_materialized_batch(int64_t count)
@@ -494,6 +541,7 @@ void ObDASIvfCidVecCacheScanIter::release_replay_entry()
   }
   replay_entry_ = nullptr;
   replay_idx_ = 0;
+  clear_replay_flat_table_view();
 }
 
 int ObDASIvfCidVecCacheScanIter::flush_building_cluster()
@@ -565,6 +613,10 @@ int ObDASIvfCidVecCacheScanIter::acquire_cid_and_set_mode(uint64_t new_cid)
         replay_entry_shell_ = replay_entry_;
       }
       session_stats_.replay_cid_cnt_++;
+      if (OB_FAIL(bind_replay_flat_table_view())) {
+        LOG_WARN("failed to bind replay flat table view, fall back to full row materialize", K(ret), K(new_cid));
+        ret = OB_SUCCESS;
+      }
     } else if (lookup_result == share::ObIvfCidClusterLookupResult::MISS) {
       mode_ = ScanMode::MISS;
       session_stats_.storage_only_cid_cnt_++;
@@ -823,6 +875,120 @@ int ObDASIvfCidVecCacheScanIter::append_fill_row(int64_t batch_idx)
   return ret;
 }
 
+int ObDASIvfCidVecCacheScanIter::materialize_replay_payload_to_eval(
+    const char *payload,
+    const int32_t payload_len,
+    const int64_t batch_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(cid_vec_ctdef_) || OB_ISNULL(eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (payload_len > 0 && OB_ISNULL(payload)) {
+    ret = OB_INVALID_DATA;
+  } else {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
+    guard.set_batch_idx(batch_idx);
+    ObDatum &payload_datum = cid_vec_ctdef_->result_output_.at(1)->locate_datum_for_write(*eval_ctx_);
+    payload_datum.set_string(payload, payload_len);
+  }
+  return ret;
+}
+
+int ObDASIvfCidVecCacheScanIter::replay_materialize_payload_only_at(
+    const int64_t row_idx,
+    const int64_t batch_idx)
+{
+  int ret = OB_SUCCESS;
+  if (!use_lazy_replay_payload() || OB_ISNULL(replay_entry_) || OB_ISNULL(replay_entry_->kv_flat_buf_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (row_idx < 0 || row_idx >= replay_flat_view_.hdr_->row_count_) {
+    ret = OB_ARRAY_OUT_OF_RANGE;
+  } else {
+    const int32_t payload_len = replay_flat_view_.payload_len_tbl_[row_idx];
+    const int64_t poff = replay_flat_view_.payload_off_tbl_[row_idx];
+    const char *payload = nullptr;
+    if (payload_len > 0 && poff >= 0 && poff + payload_len <= replay_flat_view_.flat_len_) {
+      payload = replay_entry_->kv_flat_buf_ + poff;
+    }
+    if (payload_len > 0 && OB_ISNULL(payload)) {
+      ret = OB_INVALID_DATA;
+    } else if (OB_FAIL(materialize_replay_payload_to_eval(payload, payload_len, batch_idx))) {
+      LOG_WARN("failed to materialize replay payload", K(ret), K(row_idx), K(batch_idx));
+    }
+  }
+  return ret;
+}
+
+int ObDASIvfCidVecCacheScanIter::try_get_lazy_replay_main_rowkey(
+    ObDASScanIter *cid_vec_iter,
+    ObEvalCtx &eval_ctx,
+    ObIAllocator &allocator,
+    const ObDASScanCtDef *cid_vec_ctdef,
+    const int64_t rowkey_cnt,
+    ObRowkey &main_rowkey,
+    const bool need_alloc)
+{
+  int ret = OB_ENTRY_NOT_EXIST;
+  ObDASIvfCidVecCacheScanIter *cache_iter = dynamic_cast<ObDASIvfCidVecCacheScanIter *>(cid_vec_iter);
+  if (OB_ISNULL(cache_iter) || !cache_iter->use_lazy_replay_payload()
+      || OB_ISNULL(cache_iter->replay_entry_) || OB_ISNULL(cache_iter->replay_entry_->kv_flat_buf_)
+      || OB_ISNULL(cid_vec_ctdef)) {
+  } else {
+    const int64_t batch_idx = eval_ctx.get_batch_idx();
+    if (batch_idx < 0 || batch_idx >= cache_iter->materialized_batch_cnt_
+        || cache_iter->materialized_batch_[batch_idx] == 0) {
+    } else {
+      const int64_t row_idx = cache_iter->materialized_batch_row_idx_[batch_idx];
+      if (row_idx < 0) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObObj rk_objs[OB_MAX_ROWKEY_COLUMN_NUMBER];
+        ObRowkey rk;
+        if (OB_FAIL(share::ivf_cid_flat_replay_rowkey_at(cache_iter->replay_entry_->kv_flat_buf_,
+                cache_iter->replay_flat_view_.flat_len_,
+                row_idx,
+                rk_objs,
+                OB_MAX_ROWKEY_COLUMN_NUMBER,
+                rk))) {
+          LOG_WARN("failed to lazy replay rowkey", K(ret), K(row_idx), K(batch_idx));
+        } else {
+          const int64_t obj_cnt = rk.get_obj_cnt();
+          if (obj_cnt > rowkey_cnt) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("lazy rowkey obj cnt mismatch", K(ret), K(obj_cnt), K(rowkey_cnt));
+          } else if (obj_cnt <= 0) {
+            ret = OB_SUCCESS;
+            main_rowkey.reset();
+          } else if (need_alloc) {
+            ObObj *obj_buf = static_cast<ObObj *>(allocator.alloc(sizeof(ObObj) * obj_cnt));
+            if (OB_ISNULL(obj_buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              for (int64_t i = 0; i < obj_cnt; ++i) {
+                obj_buf[i] = rk.get_obj_ptr()[i];
+              }
+              main_rowkey.assign(obj_buf, obj_cnt);
+              ret = OB_SUCCESS;
+            }
+          } else {
+            ObObj *obj_ptr = main_rowkey.get_obj_ptr();
+            if (OB_ISNULL(obj_ptr) || main_rowkey.get_obj_cnt() < obj_cnt) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              for (int64_t i = 0; i < obj_cnt; ++i) {
+                obj_ptr[i] = rk.get_obj_ptr()[i];
+              }
+              main_rowkey.assign(obj_ptr, obj_cnt);
+              ret = OB_SUCCESS;
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDASIvfCidVecCacheScanIter::replay_materialize_at(const int64_t row_idx, const int64_t batch_idx)
 {
   int ret = OB_SUCCESS;
@@ -852,6 +1018,16 @@ int ObDASIvfCidVecCacheScanIter::replay_one_row()
   int ret = OB_SUCCESS;
   if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->row_count_) {
     ret = OB_ITER_END;
+  } else if (use_lazy_replay_payload()) {
+    if (OB_FAIL(replay_materialize_payload_only_at(replay_idx_, 0))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to replay payload-only row", K(ret));
+      }
+    } else {
+      materialized_batch_row_idx_[0] = replay_idx_++;
+      session_stats_.replay_row_cnt_++;
+      mark_materialized_batch(1);
+    }
   } else if (OB_FAIL(replay_materialize_at(replay_idx_++, 0))) {
     if (OB_ITER_END != ret) {
       LOG_WARN("failed to replay row", K(ret));
@@ -867,9 +1043,23 @@ int ObDASIvfCidVecCacheScanIter::replay_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
   count = 0;
+  const bool lazy_replay = use_lazy_replay_payload();
   while (OB_SUCC(ret) && count < capacity) {
     if (OB_ISNULL(replay_entry_) || replay_idx_ >= replay_entry_->row_count_) {
       ret = OB_ITER_END;
+    } else if (lazy_replay) {
+      const int64_t row_idx = replay_idx_++;
+      if (OB_FAIL(replay_materialize_payload_only_at(row_idx, count))) {
+        LOG_WARN("failed to replay payload-only row", K(ret), K(row_idx));
+      } else {
+        if (count < MATERIALIZED_BATCH_CAP) {
+          materialized_batch_[count] = 1;
+          materialized_batch_row_idx_[count] = row_idx;
+          materialized_batch_cnt_ = count + 1;
+        }
+        count++;
+        session_stats_.replay_row_cnt_++;
+      }
     } else if (OB_FAIL(replay_materialize_at(replay_idx_++, count))) {
       LOG_WARN("failed to replay row", K(ret));
     } else {

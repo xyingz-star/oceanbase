@@ -2183,6 +2183,19 @@ int ObDASIvfBaseScanIter::get_main_rowkey_from_cid_vec_datum(ObIAllocator& alloc
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ctdef or rtdef is null", K(ret), KP(cid_vec_ctdef));
   } else {
+    ObDASScanRtDef *cid_vec_rtdef = vec_aux_rtdef_->get_vec_aux_tbl_rtdef(vec_aux_ctdef_->get_ivf_cid_vec_tbl_idx());
+    ObEvalCtx *cid_vec_eval_ctx = OB_NOT_NULL(cid_vec_rtdef) ? cid_vec_rtdef->eval_ctx_ : vec_aux_rtdef_->eval_ctx_;
+    if (OB_NOT_NULL(cid_vec_iter_) && OB_NOT_NULL(cid_vec_eval_ctx)) {
+      const int lazy_ret = ObDASIvfCidVecCacheScanIter::try_get_lazy_replay_main_rowkey(
+          cid_vec_iter_, *cid_vec_eval_ctx, allocator, cid_vec_ctdef, rowkey_cnt, main_rowkey, need_alloc);
+      if (lazy_ret == OB_SUCCESS) {
+        return OB_SUCCESS;
+      } else if (lazy_ret != OB_ENTRY_NOT_EXIST) {
+        ret = lazy_ret;
+        LOG_WARN("failed to get lazy replay rowkey", K(ret));
+        return ret;
+      }
+    }
     // cid_vec_scan_iter output: [IVF_CID_VEC_CID_COL IVF_CID_VEC_VECTOR_COL ROWKEY]
     // Note: when _enable_defensive_check = 2, cid_vec_out_exprs is [IVF_CID_VEC_CID_COL IVF_CID_VEC_VECTOR_COL ROWKEY
     // DEFENSE_CHECK_COL]
@@ -2201,8 +2214,10 @@ int ObDASIvfBaseScanIter::get_main_rowkey_from_cid_vec_datum(ObIAllocator& alloc
     }
     if (OB_FAIL(ret)) {
     } else {
-      ObDASScanRtDef *cid_vec_rtdef = vec_aux_rtdef_->get_vec_aux_tbl_rtdef(vec_aux_ctdef_->get_ivf_cid_vec_tbl_idx());
-      ObEvalCtx *cid_vec_eval_ctx = OB_NOT_NULL(cid_vec_rtdef) ? cid_vec_rtdef->eval_ctx_ : vec_aux_rtdef_->eval_ctx_;
+      ObDASScanRtDef *cid_vec_rtdef_inner =
+          vec_aux_rtdef_->get_vec_aux_tbl_rtdef(vec_aux_ctdef_->get_ivf_cid_vec_tbl_idx());
+      ObEvalCtx *cid_vec_eval_ctx_inner =
+          OB_NOT_NULL(cid_vec_rtdef_inner) ? cid_vec_rtdef_inner->eval_ctx_ : vec_aux_rtdef_->eval_ctx_;
       int rowkey_idx = 0;
       for (int64_t i = 2; OB_SUCC(ret) && i < cid_vec_out_exprs.count() && rowkey_idx < rowkey_cnt; ++i) {
         ObObj tmp_obj;
@@ -2210,7 +2225,7 @@ int ObDASIvfBaseScanIter::get_main_rowkey_from_cid_vec_datum(ObIAllocator& alloc
         if (OB_ISNULL(expr)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("should not be null", K(ret));
-        } else if (OB_FAIL(expr->locate_expr_datum(*cid_vec_eval_ctx).to_obj(obj_ptr[rowkey_idx++], expr->obj_meta_, expr->obj_datum_map_))) {
+        } else if (OB_FAIL(expr->locate_expr_datum(*cid_vec_eval_ctx_inner).to_obj(obj_ptr[rowkey_idx++], expr->obj_meta_, expr->obj_datum_map_))) {
           LOG_WARN("convert datum to obj failed", K(ret));
         }
       }

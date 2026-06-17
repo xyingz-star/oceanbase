@@ -15,12 +15,15 @@
 
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "share/vector_index/ob_ivf_cid_cluster_cache.h"
+#include "share/vector_index/ob_ivf_cid_cluster_kv_cache.h"
 #include "share/vector_index/ob_vector_index_param.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+class ObEvalCtx;
 
 /// Per-row norm path in get_rowkeys_to_heap when skip_payload_lob_read (REPLAY/FILL materialized).
 enum class ObIvfReplayNormRowKind : int8_t
@@ -74,6 +77,14 @@ public:
   bool get_replay_flat(const char *&flat_buf, int64_t &flat_len, int64_t &row_count) const;
   bool get_pq_replay_flat(const char *&flat_buf, int64_t &flat_len, int64_t &row_count) const;
   void add_replay_rows_served(int64_t row_cnt);
+  /// IVF FLAT/SQ8/PQ REPLAY: rowkey is decoded from flat blob on demand (heap push / prefilter).
+  static int try_get_lazy_replay_main_rowkey(ObDASScanIter *cid_vec_iter,
+      ObEvalCtx &eval_ctx,
+      ObIAllocator &allocator,
+      const ObDASScanCtDef *cid_vec_ctdef,
+      const int64_t rowkey_cnt,
+      ObRowkey &main_rowkey,
+      bool need_alloc);
   void export_log_snapshot(share::ObIvfCidClusterCacheLogSnapshot &out) const;
   /// Reset per-query session counters and cache scan state (e.g. adaptive IVF retry).
   void reset_per_query_session_stats();
@@ -107,6 +118,12 @@ private:
   int replay_one_row();
   int replay_rows(int64_t &count, int64_t capacity);
   int replay_materialize_at(int64_t row_idx, int64_t batch_idx);
+  int replay_materialize_payload_only_at(int64_t row_idx, int64_t batch_idx);
+  int materialize_replay_payload_to_eval(const char *payload, int32_t payload_len, int64_t batch_idx);
+  int bind_replay_flat_table_view();
+  void clear_replay_flat_table_view();
+  bool use_lazy_replay_payload() const;
+  static bool is_ivf_cache_lazy_replay_algo(ObVectorIndexAlgorithmType algo);
   share::ObIvfCidClusterPayloadType payload_type() const;
   int materialize_row_to_eval(const share::ObIvfCidClusterRow &row, int64_t batch_idx);
   /// Open storage scan if result_ is null (after REPLAY), else rescan. Used by FILL and MISS.
@@ -135,6 +152,9 @@ private:
   static const int64_t MATERIALIZED_BATCH_CAP = 1024;
   int64_t materialized_batch_cnt_;
   uint8_t materialized_batch_[MATERIALIZED_BATCH_CAP];
+  int64_t materialized_batch_row_idx_[MATERIALIZED_BATCH_CAP];
+  share::ObIvfCidFlatReplayTableView replay_flat_view_;
+  bool lazy_replay_payload_;
   /// Set in inner_init when FILL/REPLAY path is enabled (stable for latency stats).
   bool cache_was_active_;
   share::ObIvfCidClusterCacheSessionStats session_stats_;

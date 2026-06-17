@@ -628,6 +628,25 @@ int ivf_cid_flat_reopen_replay_entry(const char *flat_buf, const int64_t flat_le
   return ret;
 }
 
+int ivf_cid_flat_open_replay_table_view(const char *flat_buf,
+    const int64_t flat_len,
+    ObIvfCidFlatReplayTableView &view)
+{
+  int ret = OB_SUCCESS;
+  view.reset();
+  if (OB_FAIL(ivf_cid_flat_header_tables_(flat_buf,
+          flat_len,
+          view.hdr_,
+          view.payload_off_tbl_,
+          view.payload_len_tbl_,
+          view.rowkey_off_tbl_,
+          view.rowkey_len_tbl_))) {
+  } else {
+    view.flat_len_ = flat_len;
+  }
+  return ret;
+}
+
 int ivf_cid_flat_replay_payload_at(const char *flat_buf,
     const int64_t flat_len,
     const int64_t row_idx,
